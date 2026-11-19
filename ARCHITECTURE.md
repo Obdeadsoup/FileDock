@@ -1,6 +1,6 @@
 # FileDock 架构
 
-FileDock 是单 Go module。当前 HTTP 服务只使用标准库。
+FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前仅允许 `internal/store/sqlite` 直接导入 `modernc.org/sqlite`。
 
 | 包 | 职责 | 可依赖的模块内包 |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ FileDock 是单 Go module。当前 HTTP 服务只使用标准库。
 
 ## 自动检查
 
-架构测试通过 `go list` 读取当前构建配置下本模块生产包的直接导入。入口、配置与存储适配器可使用标准库。业务层可使用 `bytes`、`context`、`errors`、`fmt`、`io`、`path`、`slices`、`strconv`、`strings`、`sync` 和 `time`。HTTP 层在这份清单的基础上可使用 `encoding/json` 和 `net/http`。首轮禁止引入第三方包。对允许包内具体 API 的使用仍需通过代码审查，例如 HTTP handler 禁止调用 `http.ServeFile`。
+架构测试通过 `go list` 读取当前构建配置下本模块生产包的直接导入。入口、配置与存储适配器可使用标准库。业务层可使用 `bytes`、`context`、`errors`、`fmt`、`io`、`path`、`slices`、`strconv`、`strings`、`sync` 和 `time`。HTTP 层在这份清单的基础上可使用 `encoding/json` 和 `net/http`。第三方依赖默认禁止，仅允许 `internal/store/sqlite` 直接导入 `modernc.org/sqlite`，业务层、HTTP 层、入口、配置及其他适配器均禁止直接导入。对允许包内具体 API 的使用仍需通过代码审查，例如 HTTP handler 禁止调用 `http.ServeFile`。
 
 ## 文件操作示例
 

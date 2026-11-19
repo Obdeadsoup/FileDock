@@ -76,6 +76,9 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 		if imported == modulePath || strings.HasPrefix(imported, modulePath+"/") {
 			return "imported package has no layer assignment"
 		}
+		if importer == modulePath+"/internal/store/sqlite" && imported == "modernc.org/sqlite" {
+			return ""
+		}
 		return "external dependencies are forbidden"
 	case command:
 		return "production packages may not import the command entry point"
@@ -191,7 +194,14 @@ func TestDependencyRules(t *testing.T) {
 		{files, "io", true, false},
 		{sqlite, files, false, false},
 		{sqlite, "database/sql", true, false},
+		{sqlite, "modernc.org/sqlite", false, false},
+		{sqlite, "github.com/other/pkg", false, true},
 		{disk, "os", true, false},
+		{disk, "modernc.org/sqlite", false, true},
+		{api, "modernc.org/sqlite", false, true},
+		{files, "modernc.org/sqlite", false, true},
+		{entry, "modernc.org/sqlite", false, true},
+		{cfg, "modernc.org/sqlite", false, true},
 		{api, sqlite, false, true},
 		{api, "database/sql", true, true},
 		{api, "os", true, true},
