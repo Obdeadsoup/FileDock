@@ -5,15 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"example.com/filedock/internal/accounts"
 	"example.com/filedock/internal/files"
 )
 
-const multipartBodyOverhead int64 = 1 << 20 // 1 MiB for multipart headers and boundaries.
+const (
+	multipartBodyOverhead   int64 = 1 << 20 // 1 MiB for multipart headers and boundaries.
+	maxCredentialsBodyBytes int64 = 4 << 10 // 4 KiB limit for auth JSON payloads.
+	uniformLoginFailedMsg         = "invalid username or password"
+)
 
 var errMultipleFileParts = errors.New("multiple file parts are not allowed")
 
@@ -23,6 +29,23 @@ type badRequestError struct {
 
 func (e badRequestError) Error() string { return e.err.Error() }
 func (e badRequestError) Unwrap() error { return e.err }
+
+type credentialsRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type userResponse struct {
+	ID        string    `json:"id"`
+	Username  string    `json:"username"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type loginResponse struct {
+	Token     string       `json:"token"`
+	ExpiresAt time.Time    `json:"expires_at"`
+	User      userResponse `json:"user"`
+}
 
 type fileResponse struct {
 	ID        string    `json:"id"`
@@ -37,15 +60,23 @@ type errorResponse struct {
 }
 
 type handler struct {
-	svc *files.Service
+	files    *files.Service
+	accounts *accounts.Service
 }
 
-// NewHandler constructs the HTTP router for FileDock endpoints.
-func NewHandler(svc *files.Service) http.Handler {
+// NewHandler constructs the HTTP router for FileDock health, auth, and file endpoints.
+func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", health)
 
-	h := &handler{svc: svc}
+	h := &handler{
+		files:    fileSvc,
+		accounts: accountSvc,
+	}
+	mux.HandleFunc("POST /api/v1/auth/register", h.register)
+	mux.HandleFunc("POST /api/v1/auth/login", h.login)
+	mux.HandleFunc("POST /api/v1/auth/logout", h.logout)
+
 	mux.HandleFunc("POST /api/v1/files", h.uploadFile)
 	mux.HandleFunc("GET /api/v1/files", h.listFiles)
 	mux.HandleFunc("GET /api/v1/files/{id}/content", h.downloadFile)
@@ -62,15 +93,177 @@ func health(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
-	if h.svc == nil {
-		writeError(w, http.StatusServiceUnavailable, "file service unavailable")
+func (h *handler) register(w http.ResponseWriter, r *http.Request) {
+	if h.accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, "account service unavailable")
 		return
 	}
 
-	maxBodyBytes := h.svc.MaxFileSize() + multipartBodyOverhead
+	req, ok := decodeCredentialsRequest(w, r)
+	if !ok {
+		return
+	}
+
+	user, err := h.accounts.Register(r.Context(), req.Username, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, accounts.ErrInvalidUsername), errors.Is(err, accounts.ErrInvalidPassword):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, accounts.ErrUsernameTaken):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to register user")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, toUserResponse(user))
+}
+
+func (h *handler) login(w http.ResponseWriter, r *http.Request) {
+	if h.accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, "account service unavailable")
+		return
+	}
+
+	req, ok := decodeCredentialsRequest(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.accounts.Login(r.Context(), req.Username, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, accounts.ErrInvalidUsername), errors.Is(err, accounts.ErrInvalidPassword):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, accounts.ErrInvalidCredentials):
+			writeError(w, http.StatusUnauthorized, uniformLoginFailedMsg)
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to process login")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, loginResponse{
+		Token:     result.Token,
+		ExpiresAt: result.ExpiresAt.UTC(),
+		User:      toUserResponse(result.User),
+	})
+}
+
+func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
+	if h.accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, "account service unavailable")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxCredentialsBodyBytes)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum allowed size")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	token, ok := extractBearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.accounts.Logout(r.Context(), token); err != nil {
+		if errors.Is(err, accounts.ErrUnauthorized) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to process logout")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) (accounts.User, bool) {
+	if h.accounts == nil {
+		writeError(w, http.StatusServiceUnavailable, "account service unavailable")
+		return accounts.User{}, false
+	}
+	token, ok := extractBearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return accounts.User{}, false
+	}
+	user, err := h.accounts.Authenticate(r.Context(), token)
+	if err != nil {
+		if errors.Is(err, accounts.ErrUnauthorized) {
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return accounts.User{}, false
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify session")
+		return accounts.User{}, false
+	}
+	return user, true
+}
+
+func extractBearerToken(r *http.Request) (string, bool) {
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader == "" {
+		return "", false
+	}
+	scheme, token, found := strings.Cut(authHeader, " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token = strings.TrimSpace(token)
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", false
+	}
+	return token, true
+}
+
+func decodeCredentialsRequest(w http.ResponseWriter, r *http.Request) (credentialsRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCredentialsBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	var req credentialsRequest
+	if err := dec.Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum allowed size")
+			return credentialsRequest{}, false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON credentials payload")
+		return credentialsRequest{}, false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum allowed size")
+			return credentialsRequest{}, false
+		}
+		writeError(w, http.StatusBadRequest, "unexpected trailing data in JSON payload")
+		return credentialsRequest{}, false
+	}
+	return req, true
+}
+
+func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
+	if h.files == nil {
+		writeError(w, http.StatusServiceUnavailable, "file service unavailable")
+		return
+	}
+	user, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	maxBodyBytes := h.files.MaxFileSize() + multipartBodyOverhead
 	if maxBodyBytes <= 0 {
-		maxBodyBytes = h.svc.MaxFileSize()
+		maxBodyBytes = h.files.MaxFileSize()
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
@@ -80,16 +273,21 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nextPart := func() (string, io.ReadCloser, error) {
+	nextPart := func() (string, string, io.ReadCloser, error) {
 		p, nextErr := mr.NextPart()
 		if nextErr != nil {
-			return "", nil, nextErr
+			return "", "", nil, nextErr
 		}
-		return p.FormName(), p, nil
+		formName, rawFilename, dispErr := parsePartContentDisposition(p.Header.Get("Content-Disposition"))
+		if dispErr != nil {
+			_ = p.Close()
+			return "", "", nil, badRequestError{err: dispErr}
+		}
+		return formName, rawFilename, p, nil
 	}
 
 	for {
-		formName, part, err := nextPart()
+		formName, filename, part, err := nextPart()
 		if errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, "missing file field")
 			return
@@ -109,20 +307,14 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Extract filename before streaming body through singleFilePartReader.
-		type fileNamer interface {
-			FileName() string
-		}
-		filename := ""
-		if fn, ok := part.(fileNamer); ok {
-			filename = fn.FileName()
-		}
-
 		stream := &singleFilePartReader{
-			part:     part,
-			nextPart: nextPart,
+			part: part,
+			nextPart: func() (string, io.ReadCloser, error) {
+				name, _, nextRC, nextErr := nextPart()
+				return name, nextRC, nextErr
+			},
 		}
-		file, uploadErr := h.svc.Upload(r.Context(), filename, stream)
+		file, uploadErr := h.files.Upload(r.Context(), user.ID, filename, stream)
 		_ = part.Close()
 		if uploadErr != nil {
 			writeUploadError(w, uploadErr)
@@ -134,9 +326,47 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// parsePartContentDisposition extracts the form field name and raw un-normalized filename
+// from a multipart Content-Disposition header before any OS-specific filepath.Base stripping.
+func parsePartContentDisposition(rawHeader string) (formName, filename string, err error) {
+	if rawHeader == "" {
+		return "", "", errors.New("missing Content-Disposition header")
+	}
+	mediaType, params, err := mime.ParseMediaType(preserveBackslashesInDisposition(rawHeader))
+	if err != nil || mediaType != "form-data" {
+		return "", "", errors.New("invalid Content-Disposition header")
+	}
+	return params["name"], params["filename"], nil
+}
+
+// preserveBackslashesInDisposition keeps raw single backslashes (such as unescaped Windows
+// path separators in hand-crafted headers) intact when mime.ParseMediaType unescapes quoted-pairs.
+func preserveBackslashesInDisposition(raw string) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' {
+			if i+1 < len(raw) && (raw[i+1] == '\\' || raw[i+1] == '"') {
+				out.WriteByte('\\')
+				out.WriteByte(raw[i+1])
+				i++
+				continue
+			}
+			out.WriteString(`\\`)
+			continue
+		}
+		out.WriteByte(raw[i])
+	}
+	return out.String()
+}
+
 func (h *handler) listFiles(w http.ResponseWriter, r *http.Request) {
-	if h.svc == nil {
+	if h.files == nil {
 		writeError(w, http.StatusServiceUnavailable, "file service unavailable")
+		return
+	}
+	user, ok := h.authenticate(w, r)
+	if !ok {
 		return
 	}
 
@@ -163,7 +393,7 @@ func (h *handler) listFiles(w http.ResponseWriter, r *http.Request) {
 		offset = parsed
 	}
 
-	items, err := h.svc.List(r.Context(), limit, offset)
+	items, err := h.files.List(r.Context(), user.ID, limit, offset)
 	if err != nil {
 		if errors.Is(err, files.ErrInvalidPagination) {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -181,13 +411,17 @@ func (h *handler) listFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) downloadFile(w http.ResponseWriter, r *http.Request) {
-	if h.svc == nil {
+	if h.files == nil {
 		writeError(w, http.StatusServiceUnavailable, "file service unavailable")
+		return
+	}
+	user, ok := h.authenticate(w, r)
+	if !ok {
 		return
 	}
 
 	id := r.PathValue("id")
-	file, rc, err := h.svc.OpenContent(r.Context(), id)
+	file, rc, err := h.files.OpenContent(r.Context(), user.ID, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, files.ErrInvalidID):
@@ -278,6 +512,14 @@ func writeUploadError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "failed to store file")
+}
+
+func toUserResponse(u accounts.User) userResponse {
+	return userResponse{
+		ID:        u.ID,
+		Username:  u.Username,
+		CreatedAt: u.CreatedAt.UTC(),
+	}
 }
 
 func toFileResponse(f files.File) fileResponse {

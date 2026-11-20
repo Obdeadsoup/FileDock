@@ -15,6 +15,7 @@ type stubBlobStore struct {
 	saveFn   func(ctx context.Context, r io.Reader, maxBytes int64) (StagedBlob, error)
 	openFn   func(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	deleteFn func(ctx context.Context, objectKey string) error
+	opened   []string
 	deleted  []string
 }
 
@@ -37,6 +38,7 @@ func (s *stubBlobStore) Save(ctx context.Context, r io.Reader, maxBytes int64) (
 }
 
 func (s *stubBlobStore) Open(ctx context.Context, objectKey string) (io.ReadCloser, error) {
+	s.opened = append(s.opened, objectKey)
 	if s.openFn != nil {
 		return s.openFn(ctx, objectKey)
 	}
@@ -54,8 +56,8 @@ func (s *stubBlobStore) Delete(ctx context.Context, objectKey string) error {
 type stubMetadataStore struct {
 	records  []StoredFile
 	createFn func(ctx context.Context, file StoredFile) error
-	listFn   func(ctx context.Context, page ListPage) ([]File, error)
-	getFn    func(ctx context.Context, id string) (StoredFile, error)
+	listFn   func(ctx context.Context, ownerID string, page ListPage) ([]File, error)
+	getFn    func(ctx context.Context, ownerID, id string) (StoredFile, error)
 }
 
 func (m *stubMetadataStore) Create(ctx context.Context, file StoredFile) error {
@@ -66,23 +68,25 @@ func (m *stubMetadataStore) Create(ctx context.Context, file StoredFile) error {
 	return nil
 }
 
-func (m *stubMetadataStore) List(ctx context.Context, page ListPage) ([]File, error) {
+func (m *stubMetadataStore) List(ctx context.Context, ownerID string, page ListPage) ([]File, error) {
 	if m.listFn != nil {
-		return m.listFn(ctx, page)
+		return m.listFn(ctx, ownerID, page)
 	}
-	out := make([]File, 0, len(m.records))
+	out := make([]File, 0)
 	for _, rec := range m.records {
-		out = append(out, rec.File)
+		if rec.OwnerID == ownerID {
+			out = append(out, rec.File)
+		}
 	}
 	return out, nil
 }
 
-func (m *stubMetadataStore) GetByID(ctx context.Context, id string) (StoredFile, error) {
+func (m *stubMetadataStore) GetByID(ctx context.Context, ownerID, id string) (StoredFile, error) {
 	if m.getFn != nil {
-		return m.getFn(ctx, id)
+		return m.getFn(ctx, ownerID, id)
 	}
 	for _, rec := range m.records {
-		if rec.ID == id {
+		if rec.ID == id && rec.OwnerID == ownerID {
 			return rec, nil
 		}
 	}
@@ -123,7 +127,7 @@ func TestUploadDeletesBlobWhenMetadataCreateFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = svc.Upload(context.Background(), "test.txt", strings.NewReader("hello"))
+	_, err = svc.Upload(context.Background(), "user-1", "test.txt", strings.NewReader("hello"))
 	if !errors.Is(err, metaErr) {
 		t.Fatalf("Upload() error = %v, want %v", err, metaErr)
 	}
@@ -132,11 +136,11 @@ func TestUploadDeletesBlobWhenMetadataCreateFails(t *testing.T) {
 	}
 }
 
-func TestUploadAllowsDuplicateNamesWithDistinctIDs(t *testing.T) {
+func TestUploadAllowsDuplicateNamesAndEnforcesOwnerIsolation(t *testing.T) {
 	blobs := &stubBlobStore{}
 	meta := &stubMetadataStore{}
 	seq := 0
-	fixedNow := time.Date(2026, 11, 19, 8, 0, 0, 0, time.UTC)
+	fixedNow := time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)
 
 	svc, err := NewService(
 		blobs,
@@ -151,11 +155,11 @@ func TestUploadAllowsDuplicateNamesWithDistinctIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := svc.Upload(context.Background(), "same.txt", bytes.NewBufferString("one"))
+	first, err := svc.Upload(context.Background(), "user-a", "same.txt", bytes.NewBufferString("one"))
 	if err != nil {
 		t.Fatalf("first Upload() error = %v", err)
 	}
-	second, err := svc.Upload(context.Background(), "same.txt", bytes.NewBufferString("two"))
+	second, err := svc.Upload(context.Background(), "user-a", "same.txt", bytes.NewBufferString("two"))
 	if err != nil {
 		t.Fatalf("second Upload() error = %v", err)
 	}
@@ -165,13 +169,31 @@ func TestUploadAllowsDuplicateNamesWithDistinctIDs(t *testing.T) {
 	if len(meta.records) != 2 {
 		t.Fatalf("metadata count = %d, want 2", len(meta.records))
 	}
+
+	// User B cannot see User A's files in list or open User A's file content.
+	bList, err := svc.List(context.Background(), "user-b", 0, 0)
+	if err != nil {
+		t.Fatalf("List(user-b) error = %v", err)
+	}
+	if len(bList) != 0 {
+		t.Fatalf("List(user-b) len = %d, want 0", len(bList))
+	}
+
+	if _, _, err := svc.OpenContent(context.Background(), "user-b", first.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("OpenContent(user-b, %q) = %v, want ErrNotFound", first.ID, err)
+	}
+	if len(blobs.opened) != 0 {
+		t.Fatalf("blobs.Open must not be called when permission/metadata check fails; opened = %v", blobs.opened)
+	}
 }
 
 func TestListPaginationBounds(t *testing.T) {
 	blobs := &stubBlobStore{}
 	var gotPage ListPage
+	var gotOwner string
 	meta := &stubMetadataStore{
-		listFn: func(ctx context.Context, page ListPage) ([]File, error) {
+		listFn: func(ctx context.Context, ownerID string, page ListPage) ([]File, error) {
+			gotOwner = ownerID
 			gotPage = page
 			return nil, nil
 		},
@@ -181,28 +203,28 @@ func TestListPaginationBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	items, err := svc.List(context.Background(), 0, 0)
+	items, err := svc.List(context.Background(), "user-1", 0, 0)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
 	if items == nil || len(items) != 0 {
 		t.Fatalf("List() = %#v, want non-nil empty slice", items)
 	}
-	if gotPage.Limit != DefaultListLimit || gotPage.Offset != 0 {
-		t.Fatalf("page = %+v, want Limit=%d Offset=0", gotPage, DefaultListLimit)
+	if gotOwner != "user-1" || gotPage.Limit != DefaultListLimit || gotPage.Offset != 0 {
+		t.Fatalf("owner=%q page=%+v, want owner=user-1 Limit=%d Offset=0", gotOwner, gotPage, DefaultListLimit)
 	}
 
-	if _, err := svc.List(context.Background(), MaxListLimit+500, 10); err != nil {
+	if _, err := svc.List(context.Background(), "user-1", MaxListLimit+500, 10); err != nil {
 		t.Fatalf("List(capped) error = %v", err)
 	}
 	if gotPage.Limit != MaxListLimit || gotPage.Offset != 10 {
 		t.Fatalf("capped page = %+v, want Limit=%d Offset=10", gotPage, MaxListLimit)
 	}
 
-	if _, err := svc.List(context.Background(), -1, 0); !errors.Is(err, ErrInvalidPagination) {
+	if _, err := svc.List(context.Background(), "user-1", -1, 0); !errors.Is(err, ErrInvalidPagination) {
 		t.Fatalf("List(negative limit) = %v, want ErrInvalidPagination", err)
 	}
-	if _, err := svc.List(context.Background(), 10, -1); !errors.Is(err, ErrInvalidPagination) {
+	if _, err := svc.List(context.Background(), "user-1", 10, -1); !errors.Is(err, ErrInvalidPagination) {
 		t.Fatalf("List(negative offset) = %v, want ErrInvalidPagination", err)
 	}
 }

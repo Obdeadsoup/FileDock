@@ -31,12 +31,17 @@ var packageLayers = map[string]layer{
 	"internal/httpapi":         httpapi,
 	"internal/archcheck":       archcheck,
 	"internal/files":           business,
+	"internal/accounts":        business,
 	"internal/store/sqlite":    store,
 	"internal/store/localdisk": store,
 }
 
 var businessStdlib = []string{
 	"bytes", "context", "errors", "fmt", "io", "path", "slices", "strconv", "strings", "sync", "time",
+}
+
+var accountsCryptoStdlib = []string{
+	"crypto/rand", "crypto/sha256", "crypto/subtle",
 }
 
 func packageLayer(modulePath, importPath string) layer {
@@ -60,9 +65,12 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 		case command, config, store:
 			return ""
 		case httpapi:
-			if imported == "net/http" || imported == "encoding/json" {
+			if imported == "net/http" || imported == "encoding/json" || imported == "mime" {
 				return ""
 			}
+		}
+		if importer == modulePath+"/internal/accounts" && slices.Contains(accountsCryptoStdlib, imported) {
+			return ""
 		}
 		if slices.Contains(businessStdlib, imported) {
 			return ""
@@ -77,6 +85,9 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 			return "imported package has no layer assignment"
 		}
 		if importer == modulePath+"/internal/store/sqlite" && imported == "modernc.org/sqlite" {
+			return ""
+		}
+		if importer == modulePath+"/internal/accounts" && imported == "golang.org/x/crypto/argon2" {
 			return ""
 		}
 		return "external dependencies are forbidden"
@@ -174,13 +185,14 @@ func TestProductionDependencies(t *testing.T) {
 func TestDependencyRules(t *testing.T) {
 	const module = "example.com/archcheck-fixture"
 	const (
-		entry   = module + "/cmd/filedockd"
-		cfg     = module + "/internal/config"
-		api     = module + "/internal/httpapi"
-		files   = module + "/internal/files"
-		sqlite  = module + "/internal/store/sqlite"
-		disk    = module + "/internal/store/localdisk"
-		unknown = module + "/internal/unknown"
+		entry    = module + "/cmd/filedockd"
+		cfg      = module + "/internal/config"
+		api      = module + "/internal/httpapi"
+		files    = module + "/internal/files"
+		accounts = module + "/internal/accounts"
+		sqlite   = module + "/internal/store/sqlite"
+		disk     = module + "/internal/store/localdisk"
+		unknown  = module + "/internal/unknown"
 	)
 	for _, tc := range []struct {
 		importer, imported string
@@ -189,17 +201,36 @@ func TestDependencyRules(t *testing.T) {
 	}{
 		{entry, cfg, false, false},
 		{entry, disk, false, false},
+		{entry, accounts, false, false},
 		{api, "net/http", true, false},
+		{api, "mime", true, false},
 		{api, files, false, false},
+		{api, accounts, false, false},
 		{files, "io", true, false},
+		{accounts, "crypto/rand", true, false},
+		{accounts, "crypto/sha256", true, false},
+		{accounts, "crypto/subtle", true, false},
+		{accounts, "golang.org/x/crypto/argon2", false, false},
 		{sqlite, files, false, false},
+		{sqlite, accounts, false, false},
 		{sqlite, "database/sql", true, false},
 		{sqlite, "modernc.org/sqlite", false, false},
 		{sqlite, "github.com/other/pkg", false, true},
+		{sqlite, "golang.org/x/crypto/argon2", false, true},
 		{disk, "os", true, false},
 		{disk, "modernc.org/sqlite", false, true},
 		{api, "modernc.org/sqlite", false, true},
+		{api, "golang.org/x/crypto/argon2", false, true},
+		{api, "crypto/rand", true, true},
 		{files, "modernc.org/sqlite", false, true},
+		{files, "golang.org/x/crypto/argon2", false, true},
+		{files, "crypto/rand", true, true},
+		{files, "crypto/sha256", true, true},
+		{files, "mime", true, true},
+		{accounts, "mime", true, true},
+		{accounts, "modernc.org/sqlite", false, true},
+		{accounts, files, false, true},
+		{files, accounts, false, true},
 		{entry, "modernc.org/sqlite", false, true},
 		{cfg, "modernc.org/sqlite", false, true},
 		{api, sqlite, false, true},

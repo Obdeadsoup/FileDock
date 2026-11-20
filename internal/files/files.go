@@ -22,6 +22,7 @@ const (
 var (
 	ErrInvalidFilename   = errors.New("invalid filename")
 	ErrInvalidID         = errors.New("invalid file id")
+	ErrInvalidOwner      = errors.New("invalid owner id")
 	ErrInvalidPagination = errors.New("invalid pagination parameters")
 	ErrFileTooLarge      = errors.New("file exceeds maximum allowed size")
 	ErrNotFound          = errors.New("file not found")
@@ -36,9 +37,10 @@ type File struct {
 	CreatedAt time.Time
 }
 
-// StoredFile pairs public file metadata with its internal storage object key.
+// StoredFile pairs public file metadata with its owner ID and internal storage object key.
 type StoredFile struct {
 	File
+	OwnerID   string
 	ObjectKey string
 }
 
@@ -62,17 +64,17 @@ type BlobStore interface {
 	Delete(ctx context.Context, objectKey string) error
 }
 
-// MetadataStore persists and queries file metadata records.
+// MetadataStore persists and queries file metadata records scoped by owner.
 type MetadataStore interface {
 	Create(ctx context.Context, file StoredFile) error
-	List(ctx context.Context, page ListPage) ([]File, error)
-	GetByID(ctx context.Context, id string) (StoredFile, error)
+	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
+	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
 }
 
 // IDGenerator produces unique, stable identifiers for uploaded files.
 type IDGenerator func() (string, error)
 
-// Service coordinates file validation, content storage, and metadata persistence.
+// Service coordinates file validation, content storage, and owner-scoped metadata persistence.
 type Service struct {
 	blobs       BlobStore
 	meta        MetadataStore
@@ -142,9 +144,12 @@ func (s *Service) MaxFileSize() int64 {
 	return s.maxFileSize
 }
 
-// Upload validates filename, streams content to BlobStore, and registers metadata.
+// Upload validates ownerID and filename, streams content to BlobStore, and registers metadata.
 // If metadata persistence fails, the newly stored blob is deleted before returning.
-func (s *Service) Upload(ctx context.Context, filename string, r io.Reader) (File, error) {
+func (s *Service) Upload(ctx context.Context, ownerID, filename string, r io.Reader) (File, error) {
+	if err := ValidateID(ownerID); err != nil {
+		return File{}, fmt.Errorf("%w: %v", ErrInvalidOwner, err)
+	}
 	if r == nil {
 		return File{}, fmt.Errorf("%w: empty reader", ErrInvalidFilename)
 	}
@@ -173,6 +178,7 @@ func (s *Service) Upload(ctx context.Context, filename string, r io.Reader) (Fil
 			SHA256:    staged.SHA256,
 			CreatedAt: s.now().UTC(),
 		},
+		OwnerID:   ownerID,
 		ObjectKey: staged.ObjectKey,
 	}
 
@@ -187,8 +193,11 @@ func (s *Service) Upload(ctx context.Context, filename string, r io.Reader) (Fil
 	return record.File, nil
 }
 
-// List returns a bounded page of registered files in stable order.
-func (s *Service) List(ctx context.Context, limit, offset int) ([]File, error) {
+// List returns a bounded page of registered files owned by ownerID in stable order.
+func (s *Service) List(ctx context.Context, ownerID string, limit, offset int) ([]File, error) {
+	if err := ValidateID(ownerID); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidOwner, err)
+	}
 	if limit < 0 || offset < 0 {
 		return nil, ErrInvalidPagination
 	}
@@ -199,7 +208,7 @@ func (s *Service) List(ctx context.Context, limit, offset int) ([]File, error) {
 		limit = MaxListLimit
 	}
 
-	items, err := s.meta.List(ctx, ListPage{Limit: limit, Offset: offset})
+	items, err := s.meta.List(ctx, ownerID, ListPage{Limit: limit, Offset: offset})
 	if err != nil {
 		return nil, err
 	}
@@ -209,13 +218,16 @@ func (s *Service) List(ctx context.Context, limit, offset int) ([]File, error) {
 	return items, nil
 }
 
-// OpenContent validates id, looks up file metadata, and opens a stream to its content.
-func (s *Service) OpenContent(ctx context.Context, id string) (File, io.ReadCloser, error) {
+// OpenContent validates ownerID and id, checks ownership via metadata lookup first, and only then opens the disk stream.
+func (s *Service) OpenContent(ctx context.Context, ownerID, id string) (File, io.ReadCloser, error) {
+	if err := ValidateID(ownerID); err != nil {
+		return File{}, nil, fmt.Errorf("%w: %v", ErrInvalidOwner, err)
+	}
 	if err := ValidateID(id); err != nil {
 		return File{}, nil, err
 	}
 
-	record, err := s.meta.GetByID(ctx, id)
+	record, err := s.meta.GetByID(ctx, ownerID, id)
 	if err != nil {
 		return File{}, nil, err
 	}
@@ -250,7 +262,7 @@ func ValidateFilename(name string) error {
 	return nil
 }
 
-// ValidateID checks that a file identifier is non-empty and free of path or control characters.
+// ValidateID checks that an identifier is non-empty and free of path or control characters.
 func ValidateID(id string) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("%w: empty id", ErrInvalidID)

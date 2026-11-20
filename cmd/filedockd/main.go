@@ -4,15 +4,19 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"example.com/filedock/internal/accounts"
 	"example.com/filedock/internal/config"
 	"example.com/filedock/internal/files"
 	"example.com/filedock/internal/httpapi"
@@ -22,13 +26,68 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(logger); err != nil {
+	if err := run(os.Args[1:], os.Stdout, logger); err != nil {
 		logger.Error("filedockd failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
+func run(args []string, stdout io.Writer, logger *slog.Logger) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "claim-legacy":
+			return runClaimLegacy(args[1:], stdout, logger)
+		default:
+			return fmt.Errorf("unknown command %q", args[0])
+		}
+	}
+	return runServer(logger)
+}
+
+func runClaimLegacy(args []string, stdout io.Writer, logger *slog.Logger) error {
+	fs := flag.NewFlagSet("claim-legacy", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	owner := fs.String("owner", "", "existing username to claim unowned legacy files")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse claim-legacy flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments for claim-legacy: %v", fs.Args())
+	}
+	username := strings.TrimSpace(*owner)
+	if username == "" {
+		return errors.New("claim-legacy requires --owner <username>")
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	metaStore, err := sqlite.NewStore(ctx, cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("init sqlite store: %w", err)
+	}
+	defer func() {
+		if closeErr := metaStore.Close(); closeErr != nil {
+			logger.Error("close sqlite store failed", "error", closeErr)
+		}
+	}()
+
+	claimed, err := metaStore.ClaimLegacyFiles(ctx, username)
+	if err != nil {
+		return fmt.Errorf("claim legacy files for %q: %w", username, err)
+	}
+
+	logger.Info("claimed legacy files", "owner", username, "claimed", claimed, "data_dir", cfg.DataDir)
+	_, _ = fmt.Fprintf(stdout, "claimed %d legacy file(s) for owner %s\n", claimed, username)
+	return nil
+}
+
+func runServer(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -54,6 +113,11 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 
+	accountService, err := accounts.NewService(metaStore, accounts.WithIDGenerator(newUUIDv4))
+	if err != nil {
+		return fmt.Errorf("init account service: %w", err)
+	}
+
 	fileService, err := files.NewService(blobStore, metaStore, newUUIDv4)
 	if err != nil {
 		return fmt.Errorf("init file service: %w", err)
@@ -64,7 +128,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("listen on %q: %w", cfg.Addr, err)
 	}
 	server := &http.Server{
-		Handler:           httpapi.NewHandler(fileService),
+		Handler:           httpapi.NewHandler(fileService, accountService),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
