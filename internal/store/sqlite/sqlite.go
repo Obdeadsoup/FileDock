@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,8 +72,16 @@ func NewStore(ctx context.Context, dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 
-	dbPath := filepath.Join(dataDir, "filedock.db")
-	db, err := sql.Open("sqlite", dbPath)
+	dbPath, err := filepath.Abs(filepath.Join(dataDir, "filedock.db"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve sqlite path: %w", err)
+	}
+	path := filepath.ToSlash(dbPath)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"}
+	db, err := sql.Open("sqlite", dsn.String())
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -89,7 +98,7 @@ func initDB(ctx context.Context, db *sql.DB) error {
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping sqlite: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
 		return fmt.Errorf("configure sqlite pragmas: %w", err)
 	}
 
@@ -121,6 +130,9 @@ func initDB(ctx context.Context, db *sql.DB) error {
 CREATE INDEX IF NOT EXISTS idx_files_owner_created_at_ns_id
 	ON files (owner_id, created_at_ns DESC, id ASC)`); err != nil {
 		return fmt.Errorf("create files owner index: %w", err)
+	}
+	if err := migrateFolders(ctx, tx); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -331,15 +343,24 @@ func (s *Store) Create(ctx context.Context, file files.StoredFile) error {
 	if strings.TrimSpace(file.OwnerID) == "" {
 		return files.ErrInvalidOwner
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin file registration: %w", err)
+	}
+	defer tx.Rollback()
+	if err := checkParent(ctx, tx, file.OwnerID, file.ParentID); err != nil {
+		return err
+	}
 	createdUTC := file.CreatedAt.UTC()
 	const query = `
-INSERT INTO files (id, owner_id, name, size, sha256, object_key, created_at, created_at_ns)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	_, err := s.db.ExecContext(
+INSERT INTO files (id, owner_id, parent_id, name, size, sha256, object_key, created_at, created_at_ns)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err = tx.ExecContext(
 		ctx,
 		query,
 		file.ID,
 		file.OwnerID,
+		file.ParentID,
 		file.Name,
 		file.Size,
 		file.SHA256,
@@ -350,7 +371,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 	if err != nil {
 		return fmt.Errorf("insert file metadata: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // List returns registered files owned by ownerID ordered stably by creation time descending, then ID ascending.
@@ -359,13 +380,18 @@ func (s *Store) List(ctx context.Context, ownerID string, page files.ListPage) (
 		return nil, files.ErrInvalidOwner
 	}
 	const query = `
-SELECT id, name, size, sha256, created_at
+SELECT id, name, parent_id, size, sha256, created_at
 FROM files
-WHERE owner_id = ?
+WHERE owner_id = ? AND parent_id IS ?
 ORDER BY created_at_ns DESC, id ASC
 LIMIT ? OFFSET ?`
 
-	rows, err := s.db.QueryContext(ctx, query, ownerID, page.Limit, page.Offset)
+	tx, err := s.beginList(ctx, ownerID, page.ParentID)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, query, ownerID, page.ParentID, page.Limit, page.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("query files: %w", err)
 	}
@@ -377,7 +403,7 @@ LIMIT ? OFFSET ?`
 			item         files.File
 			createdAtStr string
 		)
-		if err := rows.Scan(&item.ID, &item.Name, &item.Size, &item.SHA256, &createdAtStr); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan file row: %w", err)
 		}
 		parsedAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
@@ -395,11 +421,15 @@ LIMIT ? OFFSET ?`
 
 // GetByID retrieves stored file metadata and its object key only if both ID and ownerID match.
 func (s *Store) GetByID(ctx context.Context, ownerID, id string) (files.StoredFile, error) {
+	return getFile(ctx, s.db, ownerID, id)
+}
+
+func getFile(ctx context.Context, db rowQuerier, ownerID, id string) (files.StoredFile, error) {
 	if strings.TrimSpace(ownerID) == "" {
 		return files.StoredFile{}, files.ErrNotFound
 	}
 	const query = `
-SELECT id, owner_id, name, size, sha256, object_key, created_at
+SELECT id, owner_id, name, parent_id, size, sha256, object_key, created_at
 FROM files
 WHERE id = ? AND owner_id = ?`
 
@@ -407,10 +437,11 @@ WHERE id = ? AND owner_id = ?`
 		record       files.StoredFile
 		createdAtStr string
 	)
-	err := s.db.QueryRowContext(ctx, query, id, ownerID).Scan(
+	err := db.QueryRowContext(ctx, query, id, ownerID).Scan(
 		&record.ID,
 		&record.OwnerID,
 		&record.Name,
+		&record.ParentID,
 		&record.Size,
 		&record.SHA256,
 		&record.ObjectKey,
@@ -450,7 +481,7 @@ func (s *Store) ClaimLegacyFiles(ctx context.Context, username string) (int64, e
 		return 0, fmt.Errorf("find owner %q: %w", username, err)
 	}
 
-	res, err := tx.ExecContext(ctx, `UPDATE files SET owner_id = ? WHERE owner_id = '' OR owner_id IS NULL`, userID)
+	res, err := tx.ExecContext(ctx, `UPDATE files SET owner_id = ?, parent_id = NULL WHERE owner_id = '' OR owner_id IS NULL`, userID)
 	if err != nil {
 		return 0, fmt.Errorf("claim legacy files: %w", err)
 	}

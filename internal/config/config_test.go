@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -32,8 +33,8 @@ func TestLoadCustomValues(t *testing.T) {
 	if cfg.Addr != "127.0.0.1:9090" {
 		t.Errorf("Addr = %q, want %q", cfg.Addr, "127.0.0.1:9090")
 	}
-	if cfg.DataDir != "/tmp/filedock-test" {
-		t.Errorf("DataDir = %q, want %q", cfg.DataDir, "/tmp/filedock-test")
+	if want := filepath.FromSlash("/tmp/filedock-test"); cfg.DataDir != want {
+		t.Errorf("DataDir = %q, want %q", cfg.DataDir, want)
 	}
 }
 

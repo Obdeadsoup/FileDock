@@ -32,6 +32,7 @@ var (
 type File struct {
 	ID        string
 	Name      string
+	ParentID  *string
 	Size      int64
 	SHA256    string
 	CreatedAt time.Time
@@ -53,8 +54,9 @@ type StagedBlob struct {
 
 // ListPage defines bounded pagination parameters for listing files.
 type ListPage struct {
-	Limit  int
-	Offset int
+	Limit    int
+	Offset   int
+	ParentID *string
 }
 
 // BlobStore manages raw file content streams on storage.
@@ -66,6 +68,7 @@ type BlobStore interface {
 
 // MetadataStore persists and queries file metadata records scoped by owner.
 type MetadataStore interface {
+	TreeStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
@@ -147,8 +150,13 @@ func (s *Service) MaxFileSize() int64 {
 // Upload validates ownerID and filename, streams content to BlobStore, and registers metadata.
 // If metadata persistence fails, the newly stored blob is deleted before returning.
 func (s *Service) Upload(ctx context.Context, ownerID, filename string, r io.Reader) (File, error) {
-	if err := ValidateID(ownerID); err != nil {
-		return File{}, fmt.Errorf("%w: %v", ErrInvalidOwner, err)
+	return s.UploadTo(ctx, ownerID, nil, filename, r)
+}
+
+// UploadTo streams a file into the selected directory.
+func (s *Service) UploadTo(ctx context.Context, ownerID string, parentID *string, filename string, r io.Reader) (File, error) {
+	if err := s.CheckParent(ctx, ownerID, parentID); err != nil {
+		return File{}, err
 	}
 	if r == nil {
 		return File{}, fmt.Errorf("%w: empty reader", ErrInvalidFilename)
@@ -174,6 +182,7 @@ func (s *Service) Upload(ctx context.Context, ownerID, filename string, r io.Rea
 		File: File{
 			ID:        id,
 			Name:      filename,
+			ParentID:  parentID,
 			Size:      staged.Size,
 			SHA256:    staged.SHA256,
 			CreatedAt: s.now().UTC(),
@@ -195,20 +204,19 @@ func (s *Service) Upload(ctx context.Context, ownerID, filename string, r io.Rea
 
 // List returns a bounded page of registered files owned by ownerID in stable order.
 func (s *Service) List(ctx context.Context, ownerID string, limit, offset int) ([]File, error) {
-	if err := ValidateID(ownerID); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidOwner, err)
-	}
-	if limit < 0 || offset < 0 {
-		return nil, ErrInvalidPagination
-	}
-	if limit == 0 {
-		limit = DefaultListLimit
-	}
-	if limit > MaxListLimit {
-		limit = MaxListLimit
-	}
+	return s.ListIn(ctx, ownerID, nil, limit, offset)
+}
 
-	items, err := s.meta.List(ctx, ownerID, ListPage{Limit: limit, Offset: offset})
+// ListIn returns a page of the direct files of a directory.
+func (s *Service) ListIn(ctx context.Context, ownerID string, parentID *string, limit, offset int) ([]File, error) {
+	if err := validateLocation(ownerID, parentID); err != nil {
+		return nil, err
+	}
+	page, err := newPage(parentID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.meta.List(ctx, ownerID, page)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +224,14 @@ func (s *Service) List(ctx context.Context, ownerID string, limit, offset int) (
 		return []File{}, nil
 	}
 	return items, nil
+}
+
+// UpdateFile atomically renames or moves a file without touching its content.
+func (s *Service) UpdateFile(ctx context.Context, ownerID, id string, changes Changes) (File, error) {
+	if err := changes.validate(ownerID, id); err != nil {
+		return File{}, err
+	}
+	return s.meta.UpdateFile(ctx, ownerID, id, changes)
 }
 
 // OpenContent validates ownerID and id, checks ownership via metadata lookup first, and only then opens the disk stream.

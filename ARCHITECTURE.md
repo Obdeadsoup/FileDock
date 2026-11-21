@@ -8,8 +8,8 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | `internal/config` | 读取和校验进程配置 | 无 |
 | `internal/httpapi` | 注册路由、解析 HTTP 请求与会话令牌、调用业务服务、转换 HTTP 响应 | 已登记的业务包（`internal/accounts`、`internal/files`） |
 | `internal/accounts` | 账户注册、Argon2id 密码校验、Bearer 会话令牌签发、认证与撤销 | 无 |
-| `internal/files` | 文件所有者权限判断、文件名和大小校验、协调内容写入与元数据登记及流式下载 | 无 |
-| `internal/store/sqlite` | 通过 `database/sql` 持久化账户、会话摘要与文件元数据，执行事务化迁移与旧文件认领 | `internal/accounts`、`internal/files` |
+| `internal/files` | 校验文件和目录名称、标识和分页，协调目录管理、文件移动、内容写入与下载 | 无 |
+| `internal/store/sqlite` | 持久化账户、会话摘要、文件与目录元数据，执行事务化迁移、树约束检查与旧文件认领 | `internal/accounts`、`internal/files` |
 | `internal/store/localdisk` | 本地磁盘暂存、流式写入、计算 SHA-256 与打开内容流 | `internal/files` |
 | `internal/archcheck` | 在 `go test ./...` 中检查生产代码的直接导入 | 规则实现位于测试文件 |
 
@@ -31,8 +31,15 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | 操作 | `internal/httpapi` | `internal/accounts` / `internal/files` | `internal/store/` |
 | --- | --- | --- | --- |
 | 注册 / 登录 / 退出 | 限制凭据请求大小，解析 JSON 或 Bearer 头，转换统一状态码 | `accounts` 校验用户名密码、计算 Argon2id 哈希与令牌 SHA-256 摘要、管理会话生命周期 | `sqlite` 保存用户盐值、哈希、Argon2id 参数及会话令牌摘要 |
-| 上传 | 认证会话取得用户 ID，流式解析 multipart 并提取原始文件名 | `files` 校验所有者 ID、文件名和大小，协调内容写入与元数据登记 | `localdisk` 将内容流写入磁盘，`sqlite` 保存带 `owner_id` 的元数据 |
-| 列表 | 认证会话取得用户 ID，解析分页参数，返回 JSON | `files` 按所有者 ID 查询条目和有上限分页 | `sqlite` 按 `owner_id` 查询文件元数据 |
+| 上传 | 认证会话取得用户 ID，解析目标目录与 multipart 流 | `files` 检查目标归属、文件名和大小，协调内容写入与元数据登记 | `localdisk` 写入内容，`sqlite` 在登记事务中再次检查目标目录 |
+| 列表 | 认证会话取得用户 ID，解析目录和分页参数，返回 JSON | `files` 校验目录 ID 和分页上限 | `sqlite` 在同一读取事务中校验目录归属并查询直接子项 |
+| 目录和移动 | 认证会话，解析 JSON 与资源 ID，转换错误码 | `files` 校验名称和位置，向存储提交单个变更 | `sqlite` 在写入事务中检查归属、目录环路及删除前的子项，原子更新元数据 |
 | 下载 | 认证会话取得用户 ID，解析文件标识，设置响应头并输出内容流 | `files` 先按 `(owner_id, id)` 校验归属并查询元数据，再取得内容流 | `sqlite` 按 `id` 与 `owner_id` 查找元数据，`localdisk` 打开内容流 |
 
 所有操作均由 `cmd/filedockd` 完成服务和适配器的组装。
+
+## 目录一致性
+
+每个用户的逻辑根目录对应 `parent_id IS NULL`。SQLite 用索引保证同一用户同一父目录下的目录名唯一，根目录使用单独的唯一索引。写入事务先取得 SQLite 写锁，再检查目标父目录归属、移动的祖先链或待删目录的子项，避免并发操作破坏树结构。
+
+上传先检查目标再读取文件流，磁盘写入期间不持有 SQLite 写事务。元数据登记再次检查父目录，目标已被删除时返回目录不存在并清理新对象。文件的重命名和移动只更新 `name` 和 `parent_id`。

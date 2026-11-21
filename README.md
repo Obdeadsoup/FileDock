@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前（第三轮）支持账户注册、登录、退出、Bearer 会话认证，以及按文件所有者隔离的文件上传、分页列表、流式下载与第二轮旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、流式下载、重命名与移动，以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境；目录树、共享、同步与断点续传留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。文件删除、共享、同步与断点续传留待后续轮次。
 
 ## 启动服务
 
@@ -86,8 +86,8 @@ curl -fsS -H "Authorization: Bearer $TOKEN_A" \
 shasum -a 256 /tmp/filedock-download.txt
 ```
 
-- `POST /api/v1/files` 返回 HTTP `201` 和包含 `id`、`name`、`size`、`sha256`、`created_at` 的 JSON 元数据，文件所有者由当前会话决定。
-- `GET /api/v1/files` 仅返回当前登录用户拥有的文件列表（空列表返回 `[]`，支持 `?limit=50&offset=0`，上限 `100`）。
+- `POST /api/v1/files` 返回 HTTP `201` 和包含 `id`、`name`、`parent_id`、`size`、`sha256`、`created_at` 的 JSON 元数据，文件所有者由当前会话决定。
+- `GET /api/v1/files` 返回当前用户指定目录中的直接文件。省略 `parent_id` 时返回根目录文件。
 - `GET /api/v1/files/{id}/content` 先校验文件归属，再打开磁盘流并以 `Content-Disposition: attachment; ...` 返回；使用 `curl -fsS -o` 保存响应正文后，SHA-256 与原文件一致。
 
 ### 4. 验证 Bob 隔离与退出会话
@@ -106,9 +106,46 @@ curl -fsS -X POST -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/
 curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 ```
 
+## 目录管理与文件移动
+
+所有接口沿用 `Authorization: Bearer <token>`。每个账号拥有独立的逻辑根目录，由 JSON 中的 `parent_id: null` 表示。查询时省略 `parent_id` 即选择根目录，指定目录时使用非空目录 ID。
+
+| 接口 | 输入及成功结果 |
+| --- | --- |
+| `POST /api/v1/folders` | JSON `{"name":"资料","parent_id":null}`。可省略 `parent_id`。返回 `201` 和目录元数据 `id`、`name`、`parent_id`、`created_at`、`updated_at`。 |
+| `GET /api/v1/folders` | 可选查询参数 `parent_id`、`limit`、`offset`。返回 `200` 和直接子目录数组。 |
+| `PATCH /api/v1/folders/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的目录元数据。 |
+| `DELETE /api/v1/folders/{id}` | 删除空目录，返回 `204`。有直接文件或子目录时返回 `409`。 |
+| `POST /api/v1/files` | 原有 multipart `file` 字段，可通过查询参数 `parent_id` 指定上传目录。 |
+| `GET /api/v1/files` | 可选查询参数 `parent_id`、`limit`、`offset`。返回 `200` 和直接文件数组。 |
+| `PATCH /api/v1/files/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的文件元数据。原 ID 和下载 URL 继续有效。 |
+
+两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
+
+文件和目录的名称都必须是单个名称，长度最多 255 个 UTF-8 字节。禁止空名称、全空白、`.`、`..`、斜杠、反斜杠以及 ASCII 控制字符。保留输入名称的大小写和空格。同一用户在同一父目录下的目录名须唯一，根目录也适用，比较时区分大小写。同名文件可以并存。文件和目录均按 ID 操作。
+
+PATCH 省略 `parent_id` 时保留位置，显式传 `null` 时移回根目录。名称与位置同时提交时原子更新。源或目标不存在或属于其他用户时返回 `404`。目录重名、移入自身或后代目录均返回 `409`。
+
+以下命令使用 Alice 的有效会话和上传示例中的 `FILE_ID`，将文件移动到两级目录并重命名。若已执行退出示例，先重新登录取得 `TOKEN_A`。
+
+```sh
+BASE=http://127.0.0.1:8080/api/v1
+ROOT_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"course"}' "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+CHILD_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d "{\"name\":\"lab\",\"parent_id\":\"$ROOT_ID\"}" "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -fsS -X PATCH -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d "{\"name\":\"lab-notes.txt\",\"parent_id\":\"$CHILD_ID\"}" "$BASE/files/$FILE_ID"
+curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/files?parent_id=$CHILD_ID"
+curl -fsS -H "Authorization: Bearer $TOKEN_A" -o /tmp/filedock-moved.txt "$BASE/files/$FILE_ID/content"
+shasum -a 256 /tmp/filedock-demo.txt /tmp/filedock-moved.txt
+```
+
 ## 旧数据迁移与显式认领
 
 从第二轮升级时，服务启动会在事务内自动为 `files` 表补齐 `owner_id` 列（可重复执行），保留已有文件 `id`、`object_key`、`sha256`、`created_at` 和磁盘对象。旧记录的 `owner_id` 初始为空字符串，对所有普通用户不可见；服务启动和用户注册均不会隐式认领旧文件。
+
+目录迁移在同一个事务中创建 `folders` 表和索引，为 `files` 新增可空的 `parent_id` 列。迁移可重复执行，已归属的旧文件保留在其所有者的逻辑根目录。
 
 要将尚未归属的旧文件认领给某个已注册用户，可执行显式本地维护命令：
 
@@ -116,7 +153,7 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 FILEDOCK_DATA_DIR=./data go run ./cmd/filedockd claim-legacy --owner alice
 ```
 
-命令会输出本次认领的旧文件数量（例如 `claimed 1 legacy file(s) for owner alice`）；重复执行时已归属文件不会被再次修改，报告处理数量为 `0`。
+命令会输出本次认领的旧文件数量（例如 `claimed 1 legacy file(s) for owner alice`），文件随后出现在 Alice 的根目录。重复执行时已归属文件不会被再次修改，报告处理数量为 `0`。
 
 ## 测试与构建
 

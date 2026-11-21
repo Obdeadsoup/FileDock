@@ -529,7 +529,7 @@ func TestErrorCasesAndFailedUploadsExcludedFromList(t *testing.T) {
 	}
 }
 
-type failingMetaStore struct{}
+type failingMetaStore struct{ files.TreeStore }
 
 func (failingMetaStore) Create(context.Context, files.StoredFile) error {
 	return errors.New("db write failure")

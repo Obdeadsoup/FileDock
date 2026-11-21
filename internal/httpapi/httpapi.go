@@ -50,6 +50,7 @@ type loginResponse struct {
 type fileResponse struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
+	ParentID  *string   `json:"parent_id"`
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
 	CreatedAt time.Time `json:"created_at"`
@@ -80,6 +81,11 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("POST /api/v1/files", h.uploadFile)
 	mux.HandleFunc("GET /api/v1/files", h.listFiles)
 	mux.HandleFunc("GET /api/v1/files/{id}/content", h.downloadFile)
+	mux.HandleFunc("PATCH /api/v1/files/{id}", h.updateFile)
+	mux.HandleFunc("POST /api/v1/folders", h.createFolder)
+	mux.HandleFunc("GET /api/v1/folders", h.listFolders)
+	mux.HandleFunc("PATCH /api/v1/folders/{id}", h.updateFolder)
+	mux.HandleFunc("DELETE /api/v1/folders/{id}", h.deleteFolder)
 	return mux
 }
 
@@ -260,6 +266,14 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	parentID, ok := queryParent(w, r)
+	if !ok {
+		return
+	}
+	if err := h.files.CheckParent(r.Context(), user.ID, parentID); err != nil {
+		writeTreeError(w, err, "failed to check upload destination")
+		return
+	}
 
 	maxBodyBytes := h.files.MaxFileSize() + multipartBodyOverhead
 	if maxBodyBytes <= 0 {
@@ -314,7 +328,7 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 				return name, nextRC, nextErr
 			},
 		}
-		file, uploadErr := h.files.Upload(r.Context(), user.ID, filename, stream)
+		file, uploadErr := h.files.UploadTo(r.Context(), user.ID, parentID, filename, stream)
 		_ = part.Close()
 		if uploadErr != nil {
 			writeUploadError(w, uploadErr)
@@ -370,36 +384,17 @@ func (h *handler) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	q := r.URL.Query()
-	limit := 0
-	if q.Has("limit") {
-		raw := q.Get("limit")
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed <= 0 {
-			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
-			return
-		}
-		limit = parsed
+	parentID, ok := queryParent(w, r)
+	if !ok {
+		return
 	}
-
-	offset := 0
-	if q.Has("offset") {
-		raw := q.Get("offset")
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 0 {
-			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
-			return
-		}
-		offset = parsed
+	limit, offset, ok := queryPage(w, r)
+	if !ok {
+		return
 	}
-
-	items, err := h.files.List(r.Context(), user.ID, limit, offset)
+	items, err := h.files.ListIn(r.Context(), user.ID, parentID, limit, offset)
 	if err != nil {
-		if errors.Is(err, files.ErrInvalidPagination) {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to list files")
+		writeTreeError(w, err, "failed to list files")
 		return
 	}
 
@@ -511,7 +506,7 @@ func writeUploadError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeError(w, http.StatusInternalServerError, "failed to store file")
+	writeTreeError(w, err, "failed to store file")
 }
 
 func toUserResponse(u accounts.User) userResponse {
@@ -526,6 +521,7 @@ func toFileResponse(f files.File) fileResponse {
 	return fileResponse{
 		ID:        f.ID,
 		Name:      f.Name,
+		ParentID:  f.ParentID,
 		Size:      f.Size,
 		SHA256:    f.SHA256,
 		CreatedAt: f.CreatedAt.UTC(),
