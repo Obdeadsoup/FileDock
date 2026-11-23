@@ -80,8 +80,10 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 
 	mux.HandleFunc("POST /api/v1/files", h.uploadFile)
 	mux.HandleFunc("GET /api/v1/files", h.listFiles)
+	mux.HandleFunc("GET /api/v1/files/search", h.searchFiles)
 	mux.HandleFunc("GET /api/v1/files/{id}/content", h.downloadFile)
 	mux.HandleFunc("PATCH /api/v1/files/{id}", h.updateFile)
+	mux.HandleFunc("DELETE /api/v1/files/{id}", h.deleteFile)
 	mux.HandleFunc("POST /api/v1/folders", h.createFolder)
 	mux.HandleFunc("GET /api/v1/folders", h.listFolders)
 	mux.HandleFunc("PATCH /api/v1/folders/{id}", h.updateFolder)

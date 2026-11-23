@@ -123,6 +123,24 @@ func runServer(logger *slog.Logger) error {
 		return fmt.Errorf("init file service: %w", err)
 	}
 
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		fileService.RunCleanupWorker(
+			cleanupCtx,
+			files.DefaultCleanupInterval,
+			files.DefaultCleanupBatchSize,
+			func(cleanupErr error) {
+				logger.Error("blob cleanup failed", "error", cleanupErr)
+			},
+		)
+	}()
+	defer func() {
+		cancelCleanup()
+		<-cleanupDone
+	}()
+
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %q: %w", cfg.Addr, err)

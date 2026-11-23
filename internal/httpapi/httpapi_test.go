@@ -67,6 +67,7 @@ func TestHealthRejectsOtherMethods(t *testing.T) {
 
 type testEnv struct {
 	handler http.Handler
+	fileSvc *files.Service
 	cleanup func()
 	advance func(d time.Duration)
 }
@@ -111,6 +112,7 @@ func newTestEnv(t *testing.T, dataDir string, fileOpts ...files.Option) *testEnv
 
 	return &testEnv{
 		handler: NewHandler(fileSvc, accountSvc),
+		fileSvc: fileSvc,
 		cleanup: func() { _ = meta.Close() },
 		advance: func(d time.Duration) { now = now.Add(d) },
 	}
@@ -529,7 +531,10 @@ func TestErrorCasesAndFailedUploadsExcludedFromList(t *testing.T) {
 	}
 }
 
-type failingMetaStore struct{ files.TreeStore }
+type failingMetaStore struct {
+	files.TreeStore
+	files.CleanupAndSearchStore
+}
 
 func (failingMetaStore) Create(context.Context, files.StoredFile) error {
 	return errors.New("db write failure")

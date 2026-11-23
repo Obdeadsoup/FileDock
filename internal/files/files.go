@@ -69,6 +69,7 @@ type BlobStore interface {
 // MetadataStore persists and queries file metadata records scoped by owner.
 type MetadataStore interface {
 	TreeStore
+	CleanupAndSearchStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
@@ -79,11 +80,14 @@ type IDGenerator func() (string, error)
 
 // Service coordinates file validation, content storage, and owner-scoped metadata persistence.
 type Service struct {
-	blobs       BlobStore
-	meta        MetadataStore
-	idGen       IDGenerator
-	maxFileSize int64
-	now         func() time.Time
+	blobs            BlobStore
+	meta             MetadataStore
+	idGen            IDGenerator
+	maxFileSize      int64
+	now              func() time.Time
+	cleanupNotify    chan struct{}
+	cleanupBaseDelay time.Duration
+	cleanupMaxDelay  time.Duration
 }
 
 // Option configures optional settings on Service.
@@ -128,11 +132,14 @@ func NewService(blobs BlobStore, meta MetadataStore, idGen IDGenerator, opts ...
 		return nil, errors.New("id generator is required")
 	}
 	s := &Service{
-		blobs:       blobs,
-		meta:        meta,
-		idGen:       idGen,
-		maxFileSize: DefaultMaxFileSize,
-		now:         func() time.Time { return time.Now().UTC() },
+		blobs:            blobs,
+		meta:             meta,
+		idGen:            idGen,
+		maxFileSize:      DefaultMaxFileSize,
+		now:              func() time.Time { return time.Now().UTC() },
+		cleanupNotify:    make(chan struct{}, 1),
+		cleanupBaseDelay: defaultCleanupBaseDelay,
+		cleanupMaxDelay:  defaultCleanupMaxDelay,
 	}
 	for _, opt := range opts {
 		if opt != nil {

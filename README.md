@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、流式下载、重命名与移动，以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理，以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。文件删除、共享、同步与断点续传留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。共享、同步与断点续传留待后续轮次。
 
 ## 启动服务
 
@@ -118,7 +118,9 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `DELETE /api/v1/folders/{id}` | 删除空目录，返回 `204`。有直接文件或子目录时返回 `409`。 |
 | `POST /api/v1/files` | 原有 multipart `file` 字段，可通过查询参数 `parent_id` 指定上传目录。 |
 | `GET /api/v1/files` | 可选查询参数 `parent_id`、`limit`、`offset`。返回 `200` 和直接文件数组。 |
+| `GET /api/v1/files/search` | 可选查询参数 `q`（区分大小写字面子串，支持中文，`%`/`_` 按普通字符匹配）、`min_size`、`max_size`、`parent_id`、`limit`、`offset`。默认搜索当前用户所有目录，指定 `parent_id` 时仅搜索该目录的直接文件。返回 `200` 和文件数组。 |
 | `PATCH /api/v1/files/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的文件元数据。原 ID 和下载 URL 继续有效。 |
+| `DELETE /api/v1/files/{id}` | 删除当前用户拥有的文件元数据并登记后台磁盘清理，返回 `204`；随后文件从列表/搜索消失且下载地址返回 `404`。 |
 
 两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
 
@@ -139,6 +141,34 @@ curl -fsS -X PATCH -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: applica
 curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/files?parent_id=$CHILD_ID"
 curl -fsS -H "Authorization: Bearer $TOKEN_A" -o /tmp/filedock-moved.txt "$BASE/files/$FILE_ID/content"
 shasum -a 256 /tmp/filedock-demo.txt /tmp/filedock-moved.txt
+```
+
+## 文件搜索与删除演示
+
+以下命令演示创建目录、上传带中文和 `%`/`_` 的文件、按子串与大小搜索、删除文件以及删除变空的目录：
+
+```sh
+BASE=http://127.0.0.1:8080/api/v1
+DIR_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"实验目录"}' "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+printf 'round 5 search & delete payload\n' > /tmp/filedock-search.txt
+SEARCH_FILE_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" \
+  -F "file=@/tmp/filedock-search.txt;filename=实验报告_100%.txt" \
+  "$BASE/files?parent_id=$DIR_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 按中文与字面量 %/_ 及大小范围搜索（默认覆盖当前用户所有目录，也可附加 parent_id）
+curl -fsS -G -H "Authorization: Bearer $TOKEN_A" \
+  --data-urlencode "q=实验报告_100%" \
+  --data-urlencode "min_size=10" \
+  --data-urlencode "max_size=100" \
+  --data-urlencode "parent_id=$DIR_ID" \
+  "$BASE/files/search"
+
+# 删除文件（返回 204）后，下载地址返回 404，空目录即可删除（返回 204）
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$SEARCH_FILE_ID"
+curl -i -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$SEARCH_FILE_ID/content"
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/folders/$DIR_ID"
 ```
 
 ## 旧数据迁移与显式认领
