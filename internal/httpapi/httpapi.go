@@ -88,6 +88,13 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("GET /api/v1/folders", h.listFolders)
 	mux.HandleFunc("PATCH /api/v1/folders/{id}", h.updateFolder)
 	mux.HandleFunc("DELETE /api/v1/folders/{id}", h.deleteFolder)
+
+	mux.HandleFunc("POST /api/v1/shares", h.createShare)
+	mux.HandleFunc("GET /api/v1/shares", h.listShares)
+	mux.HandleFunc("DELETE /api/v1/shares/{share_id}", h.deleteShare)
+	mux.HandleFunc("GET /api/v1/shares/{share_id}/folders", h.listSharedFolders)
+	mux.HandleFunc("GET /api/v1/shares/{share_id}/files", h.listSharedFiles)
+	mux.HandleFunc("GET /api/v1/shares/{share_id}/files/{file_id}/content", h.downloadSharedFile)
 	return mux
 }
 

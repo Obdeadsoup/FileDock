@@ -70,6 +70,7 @@ type BlobStore interface {
 type MetadataStore interface {
 	TreeStore
 	CleanupAndSearchStore
+	ShareStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)

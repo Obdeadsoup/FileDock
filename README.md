@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理，以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享，以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。共享、同步与断点续传留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。同步与断点续传留待后续轮次。
 
 ## 启动服务
 
@@ -121,6 +121,12 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `GET /api/v1/files/search` | 可选查询参数 `q`（区分大小写字面子串，支持中文，`%`/`_` 按普通字符匹配）、`min_size`、`max_size`、`parent_id`、`limit`、`offset`。默认搜索当前用户所有目录，指定 `parent_id` 时仅搜索该目录的直接文件。返回 `200` 和文件数组。 |
 | `PATCH /api/v1/files/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的文件元数据。原 ID 和下载 URL 继续有效。 |
 | `DELETE /api/v1/files/{id}` | 删除当前用户拥有的文件元数据并登记后台磁盘清理，返回 `204`；随后文件从列表/搜索消失且下载地址返回 `404`。 |
+| `POST /api/v1/shares` | JSON `{"resource_type":"file"\|"folder","resource_id":"...","recipient_username":"bob"}`。创建只读共享返回 `201`，重复创建返回已有授权（`200`）。 |
+| `GET /api/v1/shares` | 必填查询参数 `direction=sent\|received`，可选 `limit`、`offset`。返回 `200` 和共享授权数组。 |
+| `DELETE /api/v1/shares/{share_id}` | 仅共享所有者可撤销，返回 `204`。撤销对后续请求立即生效。 |
+| `GET /api/v1/shares/{share_id}/folders` | 接收者浏览共享目录的直接子目录，支持可选 `parent_id`（须在共享子树内）与 `limit`、`offset`。 |
+| `GET /api/v1/shares/{share_id}/files` | 接收者浏览共享目录的直接文件（支持 `parent_id`、`limit`、`offset`）或查看单文件共享条目。 |
+| `GET /api/v1/shares/{share_id}/files/{file_id}/content` | 接收者按 `share_id` 流式下载单独共享的文件或共享目录子树内的文件（不暴露外部父目录和 `object_key`）。 |
 
 两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
 
@@ -169,6 +175,36 @@ curl -fsS -G -H "Authorization: Bearer $TOKEN_A" \
 curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$SEARCH_FILE_ID"
 curl -i -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$SEARCH_FILE_ID/content"
 curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/folders/$DIR_ID"
+```
+
+## 指定账号只读共享演示
+
+以下命令演示 Alice 将目录共享给 Bob，Bob 列出收到的共享、浏览共享目录并下载文件，以及 Alice 撤销共享后 Bob 再次访问返回 `404`：
+
+```sh
+BASE=http://127.0.0.1:8080/api/v1
+SHARE_DIR_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"shared-docs"}' "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+printf 'shared content for bob\n' > /tmp/filedock-shared.txt
+SHARED_FILE_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" \
+  -F "file=@/tmp/filedock-shared.txt;filename=guide.txt" \
+  "$BASE/files?parent_id=$SHARE_DIR_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# Alice 创建目录共享给 Bob
+SHARE_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d "{\"resource_type\":\"folder\",\"resource_id\":\"$SHARE_DIR_ID\",\"recipient_username\":\"bob\"}" \
+  "$BASE/shares" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# Bob 查看收到的共享、浏览目录并下载文件
+curl -fsS -H "Authorization: Bearer $TOKEN_B" "$BASE/shares?direction=received"
+curl -fsS -H "Authorization: Bearer $TOKEN_B" "$BASE/shares/$SHARE_ID/files"
+curl -fsS -H "Authorization: Bearer $TOKEN_B" -o /tmp/filedock-bob-dl.txt \
+  "$BASE/shares/$SHARE_ID/files/$SHARED_FILE_ID/content"
+shasum -a 256 /tmp/filedock-shared.txt /tmp/filedock-bob-dl.txt
+
+# Alice 撤销共享（204），随后 Bob 再次访问返回 404
+curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/shares/$SHARE_ID"
+curl -i -H "Authorization: Bearer $TOKEN_B" "$BASE/shares/$SHARE_ID/files/$SHARED_FILE_ID/content"
 ```
 
 ## 旧数据迁移与显式认领

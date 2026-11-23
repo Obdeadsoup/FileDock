@@ -137,6 +137,9 @@ CREATE INDEX IF NOT EXISTS idx_files_owner_created_at_ns_id
 	if err := migrateBlobCleanups(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateShares(ctx, tx); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration transaction: %w", err)

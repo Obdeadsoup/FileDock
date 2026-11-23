@@ -208,6 +208,9 @@ OR EXISTS(SELECT 1 FROM files WHERE owner_id = ? AND parent_id = ?)`, ownerID, i
 	if hasChildren {
 		return files.ErrFolderNotEmpty
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM shares WHERE resource_type = 'folder' AND resource_id = ?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM folders WHERE owner_id = ? AND id = ?`, ownerID, id); err != nil {
 		return err
 	}

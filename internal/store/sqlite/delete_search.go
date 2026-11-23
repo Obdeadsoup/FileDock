@@ -56,6 +56,10 @@ func (s *Store) DeleteFile(ctx context.Context, ownerID, id string, now time.Tim
 		return files.ErrNotFound
 	}
 
+	if _, err := tx.ExecContext(ctx, `DELETE FROM shares WHERE resource_type = 'file' AND resource_id = ?`, id); err != nil {
+		return fmt.Errorf("delete file shares: %w", err)
+	}
+
 	nowUTC := now.UTC()
 	if _, err := tx.ExecContext(
 		ctx,

@@ -65,11 +65,14 @@ func TestHealthRejectsOtherMethods(t *testing.T) {
 	}
 }
 
+var testIDSeq atomic.Int64
+
 type testEnv struct {
-	handler http.Handler
-	fileSvc *files.Service
-	cleanup func()
-	advance func(d time.Duration)
+	handler    http.Handler
+	fileSvc    *files.Service
+	accountSvc *accounts.Service
+	cleanup    func()
+	advance    func(d time.Duration)
 }
 
 func newTestEnv(t *testing.T, dataDir string, fileOpts ...files.Option) *testEnv {
@@ -86,9 +89,8 @@ func newTestEnv(t *testing.T, dataDir string, fileOpts ...files.Option) *testEnv
 	now := time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 
-	var seq atomic.Int64
 	idGen := func() (string, error) {
-		n := seq.Add(1)
+		n := testIDSeq.Add(1)
 		return fmt.Sprintf("id-%d-%d", n, os.Getpid()), nil
 	}
 
@@ -111,10 +113,11 @@ func newTestEnv(t *testing.T, dataDir string, fileOpts ...files.Option) *testEnv
 	}
 
 	return &testEnv{
-		handler: NewHandler(fileSvc, accountSvc),
-		fileSvc: fileSvc,
-		cleanup: func() { _ = meta.Close() },
-		advance: func(d time.Duration) { now = now.Add(d) },
+		handler:    NewHandler(fileSvc, accountSvc),
+		fileSvc:    fileSvc,
+		accountSvc: accountSvc,
+		cleanup:    func() { _ = meta.Close() },
+		advance:    func(d time.Duration) { now = now.Add(d) },
 	}
 }
 
@@ -534,6 +537,7 @@ func TestErrorCasesAndFailedUploadsExcludedFromList(t *testing.T) {
 type failingMetaStore struct {
 	files.TreeStore
 	files.CleanupAndSearchStore
+	files.ShareStore
 }
 
 func (failingMetaStore) Create(context.Context, files.StoredFile) error {

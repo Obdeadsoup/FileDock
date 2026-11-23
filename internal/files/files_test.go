@@ -56,6 +56,7 @@ func (s *stubBlobStore) Delete(ctx context.Context, objectKey string) error {
 type stubMetadataStore struct {
 	TreeStore
 	CleanupAndSearchStore
+	ShareStore
 	records  []StoredFile
 	createFn func(ctx context.Context, file StoredFile) error
 	listFn   func(ctx context.Context, ownerID string, page ListPage) ([]File, error)
