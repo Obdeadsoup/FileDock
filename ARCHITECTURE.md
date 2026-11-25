@@ -5,12 +5,14 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | 包 | 职责 | 可依赖的模块内包 |
 | --- | --- | --- |
 | `cmd/filedockd` | 组装依赖，启动 HTTP 服务，执行本地维护子命令（如 `claim-legacy`），管理进程日志和关闭流程 | `internal/config`、`internal/httpapi`、已登记的业务包和存储适配器 |
+| `cmd/filedock` | 命令行客户端入口（`filedock sync pull`），读取 `FILEDOCK_TOKEN` 并调用客户端包 | `internal/syncclient` |
 | `internal/config` | 读取和校验进程配置 | 无 |
 | `internal/httpapi` | 注册路由、解析 HTTP 请求与会话令牌、调用业务服务、转换 HTTP 响应 | 已登记的业务包（`internal/accounts`、`internal/files`） |
 | `internal/accounts` | 账户注册、Argon2id 密码校验、Bearer 会话令牌签发、认证与撤销 | 无 |
 | `internal/files` | 校验文件和目录名称、标识、搜索条件、共享参数、同步游标和分页，协调目录管理、文件移动、删除与后台清理、搜索、只读共享、增量同步、内容写入与下载 | 无 |
 | `internal/store/sqlite` | 持久化账户、会话摘要、文件、目录元数据、共享授权、按所有者隔离的增量变更日志与磁盘清理任务，执行事务化迁移、树约束检查、搜索查询与旧文件认领 | `internal/accounts`、`internal/files` |
 | `internal/store/localdisk` | 本地磁盘暂存、流式写入、计算 SHA-256 与打开内容流 | `internal/files` |
+| `internal/syncclient` | 客户端单向拉取同步：通过 HTTP API 认证用户并拉取变更、计算确定性本地命名、在 `os.Root` 限制内安全应用与原子提交清单 | 无 |
 | `internal/archcheck` | 在 `go test ./...` 中检查生产代码的直接导入 | 规则实现位于测试文件 |
 
 命令入口与架构测试包禁止被生产代码导入。HTTP 层禁止直接访问存储适配器、SQL、磁盘文件和进程配置。下载文件时，HTTP 层先认证会话并将用户 ID 传给 `internal/files`，从业务服务取得读取流后再写入响应。
@@ -24,7 +26,7 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 
 ## 自动检查
 
-架构测试通过 `go list` 读取当前构建配置下本模块生产包的直接导入。入口、配置与存储适配器可使用标准库。通用业务层可使用 `bytes`、`context`、`errors`、`fmt`、`io`、`path`、`slices`、`strconv`、`strings`、`sync` 和 `time`；在此基础上，仅 `internal/accounts` 可使用加密标准库 `crypto/rand`、`crypto/sha256` 和 `crypto/subtle`。HTTP 层在通用业务层标准库清单的基础上可使用 `encoding/json`、`mime` 和 `net/http`。第三方依赖默认禁止，仅允许 `internal/store/sqlite` 直接导入 `modernc.org/sqlite`、仅允许 `internal/accounts` 直接导入 `golang.org/x/crypto/argon2`，其余包均禁止直接导入第三方依赖。对允许包内具体 API 的使用仍需通过代码审查，例如 HTTP handler 禁止调用 `http.ServeFile`。
+架构测试通过 `go list` 读取当前构建配置下本模块生产包的直接导入。入口、配置、存储适配器与客户端包（`internal/syncclient`）可使用标准库。客户端入口 `cmd/filedock` 仅允许导入 `internal/syncclient`，服务端入口与服务端包禁止导入 `internal/syncclient`，`internal/syncclient` 禁止导入任何服务端模块内包。通用业务层可使用 `bytes`、`context`、`errors`、`fmt`、`io`、`path`、`slices`、`strconv`、`strings`、`sync` 和 `time`；在此基础上，仅 `internal/accounts` 可使用加密标准库 `crypto/rand`、`crypto/sha256` 和 `crypto/subtle`。HTTP 层在通用业务层标准库清单的基础上可使用 `encoding/json`、`mime` 和 `net/http`。第三方依赖默认禁止，仅允许 `internal/store/sqlite` 直接导入 `modernc.org/sqlite`、仅允许 `internal/accounts` 直接导入 `golang.org/x/crypto/argon2`，其余包均禁止直接导入第三方依赖。对允许包内具体 API 的使用仍需通过代码审查，例如 HTTP handler 禁止调用 `http.ServeFile`。
 
 ## 账户与文件操作示例
 

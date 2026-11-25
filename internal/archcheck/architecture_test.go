@@ -22,11 +22,13 @@ const (
 	httpapi   layer = "HTTP API"
 	business  layer = "business"
 	store     layer = "storage adapter"
+	client    layer = "client"
 	archcheck layer = "architecture test"
 )
 
 var packageLayers = map[string]layer{
 	"cmd/filedockd":            command,
+	"cmd/filedock":             command,
 	"internal/config":          config,
 	"internal/httpapi":         httpapi,
 	"internal/archcheck":       archcheck,
@@ -34,6 +36,7 @@ var packageLayers = map[string]layer{
 	"internal/accounts":        business,
 	"internal/store/sqlite":    store,
 	"internal/store/localdisk": store,
+	"internal/syncclient":      client,
 }
 
 var businessStdlib = []string{
@@ -62,7 +65,7 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 	}
 	if standard {
 		switch from {
-		case command, config, store:
+		case command, config, store, client:
 			return ""
 		case httpapi:
 			if imported == "net/http" || imported == "encoding/json" || imported == "mime" {
@@ -98,6 +101,15 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 	}
 	switch from {
 	case command:
+		if importer == modulePath+"/cmd/filedock" {
+			if to == client {
+				return ""
+			}
+			return "client command may only import client packages"
+		}
+		if to == client {
+			return "server command may not import client packages"
+		}
 		return ""
 	case httpapi, store:
 		if to == business {
@@ -185,14 +197,16 @@ func TestProductionDependencies(t *testing.T) {
 func TestDependencyRules(t *testing.T) {
 	const module = "example.com/archcheck-fixture"
 	const (
-		entry    = module + "/cmd/filedockd"
-		cfg      = module + "/internal/config"
-		api      = module + "/internal/httpapi"
-		files    = module + "/internal/files"
-		accounts = module + "/internal/accounts"
-		sqlite   = module + "/internal/store/sqlite"
-		disk     = module + "/internal/store/localdisk"
-		unknown  = module + "/internal/unknown"
+		entry      = module + "/cmd/filedockd"
+		cliEntry   = module + "/cmd/filedock"
+		cfg        = module + "/internal/config"
+		api        = module + "/internal/httpapi"
+		files      = module + "/internal/files"
+		accounts   = module + "/internal/accounts"
+		sqlite     = module + "/internal/store/sqlite"
+		disk       = module + "/internal/store/localdisk"
+		syncClient = module + "/internal/syncclient"
+		unknown    = module + "/internal/unknown"
 	)
 	for _, tc := range []struct {
 		importer, imported string
@@ -202,6 +216,18 @@ func TestDependencyRules(t *testing.T) {
 		{entry, cfg, false, false},
 		{entry, disk, false, false},
 		{entry, accounts, false, false},
+		{entry, syncClient, false, true},
+		{cliEntry, syncClient, false, false},
+		{cliEntry, files, false, true},
+		{cliEntry, sqlite, false, true},
+		{cliEntry, api, false, true},
+		{syncClient, "net/http", true, false},
+		{syncClient, "os", true, false},
+		{syncClient, files, false, true},
+		{syncClient, sqlite, false, true},
+		{syncClient, "modernc.org/sqlite", false, true},
+		{api, syncClient, false, true},
+		{files, syncClient, false, true},
 		{api, "net/http", true, false},
 		{api, "mime", true, false},
 		{api, files, false, false},

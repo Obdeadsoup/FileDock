@@ -77,6 +77,7 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("POST /api/v1/auth/register", h.register)
 	mux.HandleFunc("POST /api/v1/auth/login", h.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", h.logout)
+	mux.HandleFunc("GET /api/v1/auth/me", h.me)
 
 	mux.HandleFunc("POST /api/v1/files", h.uploadFile)
 	mux.HandleFunc("GET /api/v1/files", h.listFiles)
@@ -201,6 +202,14 @@ func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *handler) me(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticate(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, toUserResponse(user))
 }
 
 func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) (accounts.User, bool) {

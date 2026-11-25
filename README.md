@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口，以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口、Go 命令行客户端单向拉取同步（`cmd/filedock`），以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。客户端本地落盘、双向冲突处理与断点续传留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。双向编辑冲突、收到的共享同步、后台轮询、断点续传与 GUI 留待后续轮次。
 
 ## 启动服务
 
@@ -128,6 +128,7 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `GET /api/v1/shares/{share_id}/files` | 接收者浏览共享目录的直接文件（支持 `parent_id`、`limit`、`offset`）或查看单文件共享条目。 |
 | `GET /api/v1/shares/{share_id}/files/{file_id}/content` | 接收者按 `share_id` 流式下载单独共享的文件或共享目录子树内的文件（不暴露外部父目录和 `object_key`）。 |
 | `GET /api/v1/sync/changes` | 可选查询参数 `after`（排他游标，默认 `0`）、`limit`（默认 `50`，最大 `100`）。按当前用户独立递增 `seq` 升序返回 `items`、`next_cursor`、`has_more`。 |
+| `GET /api/v1/auth/me` | 需有效 Bearer 令牌。返回当前会话用户 `id`、`username`、`created_at`，供同步客户端校验本地状态绑定。 |
 
 两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
 
@@ -236,6 +237,54 @@ PAGE1=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/sync/changes?after=
 echo "$PAGE1"
 NEXT=$(printf '%s' "$PAGE1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["next_cursor"])')
 curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/sync/changes?after=$NEXT&limit=50"
+```
+
+## 命令行客户端单向拉取同步（`filedock sync pull`）
+
+`cmd/filedock` 提供单向拉取同步命令，每次运行将当前账号的服务端个人目录增量镜像到本地目录后退出：
+
+```sh
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.0.1:8080 --dir /tmp/mirror-a
+```
+
+### 首次运行与本地状态规则
+
+- **首次接管空目录**：目标目录不存在时自动创建；若目录非空且尚未初始化 `.filedock/state.json`，客户端直接报错退出，不接管已有文件。
+- **状态绑定与安全**：客户端在镜像目录内通过 `os.Root` 受限根目录操作所有文件，将 `server_url`、`user_id`（来自 `GET /api/v1/auth/me`）、`cursor` 与按资源 ID 索引的清单原子写入 `.filedock/state.json`；**Bearer 令牌仅从环境变量 `FILEDOCK_TOKEN` 读取，不写入状态文件或日志**。服务端地址或用户不匹配时明确报错。
+- **本地命名映射规则**：
+  - 同一父目录下名称唯一（按大小写折叠比较）且不与 `.filedock` 冲突的条目，保留原始名称。
+  - 若同一父目录下存在同名文件、仅大小写不同的条目（如 `Case.txt` 与 `case.txt`）或根目录下的 `.filedock`，每个冲突条目都会按其稳定资源 ID 的 SHA-256 前 8 位十六进制追加确定性后缀：目录为 `<name>__<tag>`，文件插入在最后扩展名前（如 `dup.txt` -> `dup__<tag>.txt`，无扩展名或以点开头无扩展名则追加到末尾）。若追加后仍与同级字面名称冲突，则升级为 16 位后缀。
+- **保护与恢复**：仅管理清单已知或本次明确创建的条目，保留陌生文件；若发现目标路径被陌生文件占用或已托管文件被手动修改，报告冲突并停止。下载先写入 `.filedock/tmp/` 并校验 SHA-256 后发布，本地全部应用完成后再原子提交 `.filedock/state.json`；中途失败可安全重跑收敛。
+
+### 双目录追赶验收演示
+
+启动服务端后，在另一终端运行以下命令，演示同一账号的两个独立镜像目录从不同游标追赶并收敛到一致的目录与文件哈希：
+
+```sh
+BASE=http://127.0.0.1:8080/api/v1
+rm -rf /tmp/mirror-a /tmp/mirror-b
+
+# 1. 创建目录与文件（含同名文件），先同步到 mirror-a
+DIR_ID=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"project"}' "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+printf 'v1 content\n' > /tmp/p1.txt
+printf 'v2 content\n' > /tmp/p2.txt
+F1=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -F "file=@/tmp/p1.txt;filename=readme.txt" "$BASE/files?parent_id=$DIR_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+F2=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -F "file=@/tmp/p2.txt;filename=readme.txt" "$BASE/files?parent_id=$DIR_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.0.1:8080 --dir /tmp/mirror-a
+
+# 2. 在服务端移动、改名并删除其中一个文件，然后让 mirror-a 增量追赶、mirror-b 从游标 0 同步
+curl -fsS -X PATCH -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"README-final.txt","parent_id":null}' "$BASE/files/$F1" >/dev/null
+curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$F2"
+
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.0.1:8080 --dir /tmp/mirror-a
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.0.1:8080 --dir /tmp/mirror-b
+
+# 3. 核对两个镜像目录的文件列表与 SHA-256 完全一致
+(cd /tmp/mirror-a && find . -path './.filedock' -prune -o -type f -print | sort | xargs shasum -a 256)
+(cd /tmp/mirror-b && find . -path './.filedock' -prune -o -type f -print | sort | xargs shasum -a 256)
 ```
 
 ## 旧数据迁移与显式认领
