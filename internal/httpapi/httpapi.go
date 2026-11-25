@@ -95,6 +95,8 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("GET /api/v1/shares/{share_id}/folders", h.listSharedFolders)
 	mux.HandleFunc("GET /api/v1/shares/{share_id}/files", h.listSharedFiles)
 	mux.HandleFunc("GET /api/v1/shares/{share_id}/files/{file_id}/content", h.downloadSharedFile)
+
+	mux.HandleFunc("GET /api/v1/sync/changes", h.listSyncChanges)
 	return mux
 }
 

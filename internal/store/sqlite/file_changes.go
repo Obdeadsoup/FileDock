@@ -2,11 +2,12 @@ package sqlite
 
 import (
 	"context"
+	"time"
 
 	"example.com/filedock/internal/files"
 )
 
-func (s *Store) UpdateFile(ctx context.Context, ownerID, id string, changes files.Changes) (files.File, error) {
+func (s *Store) UpdateFile(ctx context.Context, ownerID, id string, changes files.Changes, now time.Time) (files.File, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return files.File{}, err
@@ -27,6 +28,9 @@ func (s *Store) UpdateFile(ctx context.Context, ownerID, id string, changes file
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE files SET name = ?, parent_id = ? WHERE owner_id = ? AND id = ?`,
 		record.Name, record.ParentID, ownerID, id); err != nil {
+		return files.File{}, err
+	}
+	if err := appendFileUpsert(ctx, tx, ownerID, record.File, now); err != nil {
 		return files.File{}, err
 	}
 	return record.File, tx.Commit()

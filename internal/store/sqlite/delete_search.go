@@ -72,6 +72,10 @@ VALUES (?, ?, ?, 0, 0, '')`,
 		return fmt.Errorf("enqueue blob cleanup: %w", err)
 	}
 
+	if err := appendFileDelete(ctx, tx, ownerID, id, nowUTC); err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 

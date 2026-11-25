@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享，以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口，以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。同步与断点续传留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。客户端本地落盘、双向冲突处理与断点续传留待后续轮次。
 
 ## 启动服务
 
@@ -127,6 +127,7 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `GET /api/v1/shares/{share_id}/folders` | 接收者浏览共享目录的直接子目录，支持可选 `parent_id`（须在共享子树内）与 `limit`、`offset`。 |
 | `GET /api/v1/shares/{share_id}/files` | 接收者浏览共享目录的直接文件（支持 `parent_id`、`limit`、`offset`）或查看单文件共享条目。 |
 | `GET /api/v1/shares/{share_id}/files/{file_id}/content` | 接收者按 `share_id` 流式下载单独共享的文件或共享目录子树内的文件（不暴露外部父目录和 `object_key`）。 |
+| `GET /api/v1/sync/changes` | 可选查询参数 `after`（排他游标，默认 `0`）、`limit`（默认 `50`，最大 `100`）。按当前用户独立递增 `seq` 升序返回 `items`、`next_cursor`、`has_more`。 |
 
 两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
 
@@ -205,6 +206,36 @@ shasum -a 256 /tmp/filedock-shared.txt /tmp/filedock-bob-dl.txt
 # Alice 撤销共享（204），随后 Bob 再次访问返回 404
 curl -i -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/shares/$SHARE_ID"
 curl -i -H "Authorization: Bearer $TOKEN_B" "$BASE/shares/$SHARE_ID/files/$SHARED_FILE_ID/content"
+```
+
+## 个人目录增量同步演示
+
+以下命令演示记录旧游标后执行目录创建、上传、移动与删除，再从旧游标按页拉取增量事件（支持相同游标重读）：
+
+```sh
+BASE=http://127.0.0.1:8080/api/v1
+
+# 1. 记录当前游标
+CURSOR=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/sync/changes?after=0&limit=100" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["next_cursor"])')
+
+# 2. 创建目录、上传文件、移动文件回根目录并删除原目录与文件
+SYNC_DIR=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"sync-box"}' "$BASE/folders" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+printf 'incremental sync payload\n' > /tmp/filedock-sync.txt
+SYNC_FILE=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" \
+  -F "file=@/tmp/filedock-sync.txt;filename=sync.txt" \
+  "$BASE/files?parent_id=$SYNC_DIR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -fsS -X PATCH -H "Authorization: Bearer $TOKEN_A" -H "Content-Type: application/json" \
+  -d '{"name":"sync-moved.txt","parent_id":null}' "$BASE/files/$SYNC_FILE" >/dev/null
+curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/folders/$SYNC_DIR"
+curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$SYNC_FILE"
+
+# 3. 从旧游标分批拉取变更流（limit=2）
+PAGE1=$(curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/sync/changes?after=$CURSOR&limit=2")
+echo "$PAGE1"
+NEXT=$(printf '%s' "$PAGE1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["next_cursor"])')
+curl -fsS -H "Authorization: Bearer $TOKEN_A" "$BASE/sync/changes?after=$NEXT&limit=50"
 ```
 
 ## 旧数据迁移与显式认领

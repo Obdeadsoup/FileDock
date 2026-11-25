@@ -71,6 +71,7 @@ type MetadataStore interface {
 	TreeStore
 	CleanupAndSearchStore
 	ShareStore
+	SyncStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
@@ -239,7 +240,7 @@ func (s *Service) UpdateFile(ctx context.Context, ownerID, id string, changes Ch
 	if err := changes.validate(ownerID, id); err != nil {
 		return File{}, err
 	}
-	return s.meta.UpdateFile(ctx, ownerID, id, changes)
+	return s.meta.UpdateFile(ctx, ownerID, id, changes, s.now().UTC())
 }
 
 // OpenContent validates ownerID and id, checks ownership via metadata lookup first, and only then opens the disk stream.

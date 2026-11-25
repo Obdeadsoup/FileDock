@@ -206,7 +206,7 @@ func writeTreeError(w http.ResponseWriter, err error, fallback string) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, files.ErrInvalidID), errors.Is(err, files.ErrInvalidFilename),
 		errors.Is(err, files.ErrEmptyChanges), errors.Is(err, files.ErrInvalidPagination),
-		errors.Is(err, files.ErrInvalidSearchFilter):
+		errors.Is(err, files.ErrInvalidSearchFilter), errors.Is(err, files.ErrInvalidSyncCursor):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, fallback)

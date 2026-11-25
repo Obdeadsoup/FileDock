@@ -62,7 +62,7 @@ func TestUploadCleansUpIfDestinationIsDeletedWhileStreaming(t *testing.T) {
 	if _, err := io.WriteString(writer, "upload content"); err != nil {
 		t.Fatal(err)
 	}
-	if err := other.DeleteFolder(ctx, owner, folder.ID); err != nil {
+	if err := other.DeleteFolder(ctx, owner, folder.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {

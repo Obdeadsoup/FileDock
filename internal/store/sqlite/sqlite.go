@@ -140,6 +140,9 @@ CREATE INDEX IF NOT EXISTS idx_files_owner_created_at_ns_id
 	if err := migrateShares(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateSyncChanges(ctx, tx); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration transaction: %w", err)
@@ -377,6 +380,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if err != nil {
 		return fmt.Errorf("insert file metadata: %w", err)
 	}
+	if err := appendFileUpsert(ctx, tx, file.OwnerID, file.File, createdUTC); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -487,6 +493,38 @@ func (s *Store) ClaimLegacyFiles(ctx context.Context, username string) (int64, e
 		return 0, fmt.Errorf("find owner %q: %w", username, err)
 	}
 
+	legacyRows, err := tx.QueryContext(ctx, `
+SELECT id, name, size, sha256, created_at
+FROM files
+WHERE owner_id = '' OR owner_id IS NULL
+ORDER BY created_at_ns ASC, id ASC`)
+	if err != nil {
+		return 0, fmt.Errorf("query legacy files: %w", err)
+	}
+	var claimedFiles []files.File
+	for legacyRows.Next() {
+		var (
+			item       files.File
+			createdStr string
+		)
+		if err := legacyRows.Scan(&item.ID, &item.Name, &item.Size, &item.SHA256, &createdStr); err != nil {
+			_ = legacyRows.Close()
+			return 0, fmt.Errorf("scan legacy file: %w", err)
+		}
+		parsedAt, err := time.Parse(time.RFC3339Nano, createdStr)
+		if err != nil {
+			_ = legacyRows.Close()
+			return 0, fmt.Errorf("parse legacy created_at %q: %w", createdStr, err)
+		}
+		item.CreatedAt = parsedAt.UTC()
+		claimedFiles = append(claimedFiles, item)
+	}
+	if err := legacyRows.Err(); err != nil {
+		_ = legacyRows.Close()
+		return 0, fmt.Errorf("iterate legacy files: %w", err)
+	}
+	_ = legacyRows.Close()
+
 	res, err := tx.ExecContext(ctx, `UPDATE files SET owner_id = ?, parent_id = NULL WHERE owner_id = '' OR owner_id IS NULL`, userID)
 	if err != nil {
 		return 0, fmt.Errorf("claim legacy files: %w", err)
@@ -494,6 +532,13 @@ func (s *Store) ClaimLegacyFiles(ctx context.Context, username string) (int64, e
 	claimed, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("claim legacy rows affected: %w", err)
+	}
+
+	nowUTC := time.Now().UTC()
+	for _, item := range claimedFiles {
+		if err := appendFileUpsert(ctx, tx, userID, item, nowUTC); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

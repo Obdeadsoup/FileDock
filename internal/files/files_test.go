@@ -57,6 +57,7 @@ type stubMetadataStore struct {
 	TreeStore
 	CleanupAndSearchStore
 	ShareStore
+	SyncStore
 	records  []StoredFile
 	createFn func(ctx context.Context, file StoredFile) error
 	listFn   func(ctx context.Context, ownerID string, page ListPage) ([]File, error)

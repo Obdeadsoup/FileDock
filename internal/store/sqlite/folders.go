@@ -98,6 +98,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, folder.ID, ownerID, folder.ParentID, folder.Name,
 	if err != nil {
 		return folderWriteError(err)
 	}
+	if err := appendFolderUpsert(ctx, tx, ownerID, folder, folder.CreatedAt); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -181,6 +184,9 @@ WHERE owner_id = ? AND id = ? RETURNING `+folderColumns,
 	if err != nil {
 		return files.Folder{}, folderWriteError(err)
 	}
+	if err := appendFolderUpsert(ctx, tx, ownerID, folder, now); err != nil {
+		return files.Folder{}, err
+	}
 	return folder, tx.Commit()
 }
 
@@ -191,7 +197,7 @@ func folderWriteError(err error) error {
 	return err
 }
 
-func (s *Store) DeleteFolder(ctx context.Context, ownerID, id string) error {
+func (s *Store) DeleteFolder(ctx context.Context, ownerID, id string, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -212,6 +218,9 @@ OR EXISTS(SELECT 1 FROM files WHERE owner_id = ? AND parent_id = ?)`, ownerID, i
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM folders WHERE owner_id = ? AND id = ?`, ownerID, id); err != nil {
+		return err
+	}
+	if err := appendFolderDelete(ctx, tx, ownerID, id, now); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -538,6 +538,7 @@ type failingMetaStore struct {
 	files.TreeStore
 	files.CleanupAndSearchStore
 	files.ShareStore
+	files.SyncStore
 }
 
 func (failingMetaStore) Create(context.Context, files.StoredFile) error {

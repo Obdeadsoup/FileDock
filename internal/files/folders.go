@@ -36,8 +36,8 @@ type TreeStore interface {
 	CreateFolder(ctx context.Context, ownerID string, folder Folder) error
 	ListFolders(ctx context.Context, ownerID string, page ListPage) ([]Folder, error)
 	UpdateFolder(ctx context.Context, ownerID, id string, changes Changes, now time.Time) (Folder, error)
-	DeleteFolder(ctx context.Context, ownerID, id string) error
-	UpdateFile(ctx context.Context, ownerID, id string, changes Changes) (File, error)
+	DeleteFolder(ctx context.Context, ownerID, id string, now time.Time) error
+	UpdateFile(ctx context.Context, ownerID, id string, changes Changes, now time.Time) (File, error)
 }
 
 func validateLocation(ownerID string, parentID *string) error {
@@ -130,5 +130,5 @@ func (s *Service) DeleteFolder(ctx context.Context, ownerID, id string) error {
 	if err := validateLocation(ownerID, &id); err != nil {
 		return err
 	}
-	return s.meta.DeleteFolder(ctx, ownerID, id)
+	return s.meta.DeleteFolder(ctx, ownerID, id, s.now().UTC())
 }
