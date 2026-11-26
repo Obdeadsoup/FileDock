@@ -5,14 +5,14 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | 包 | 职责 | 可依赖的模块内包 |
 | --- | --- | --- |
 | `cmd/filedockd` | 组装依赖，启动 HTTP 服务，执行本地维护子命令（如 `claim-legacy`），管理进程日志和关闭流程 | `internal/config`、`internal/httpapi`、已登记的业务包和存储适配器 |
-| `cmd/filedock` | 命令行客户端入口（`filedock sync pull`），读取 `FILEDOCK_TOKEN` 并调用客户端包 | `internal/syncclient` |
+| `cmd/filedock` | 命令行客户端入口（`filedock sync pull` / `filedock sync push`），读取 `FILEDOCK_TOKEN` 并调用客户端包 | `internal/syncclient` |
 | `internal/config` | 读取和校验进程配置 | 无 |
 | `internal/httpapi` | 注册路由、解析 HTTP 请求与会话令牌、调用业务服务、转换 HTTP 响应 | 已登记的业务包（`internal/accounts`、`internal/files`） |
 | `internal/accounts` | 账户注册、Argon2id 密码校验、Bearer 会话令牌签发、认证与撤销 | 无 |
 | `internal/files` | 校验文件和目录名称、标识、搜索条件、共享参数、同步游标和分页，协调目录管理、文件移动、删除与后台清理、搜索、只读共享、增量同步、内容写入与下载 | 无 |
 | `internal/store/sqlite` | 持久化账户、会话摘要、文件、目录元数据、共享授权、按所有者隔离的增量变更日志与磁盘清理任务，执行事务化迁移、树约束检查、搜索查询与旧文件认领 | `internal/accounts`、`internal/files` |
 | `internal/store/localdisk` | 本地磁盘暂存、流式写入、计算 SHA-256 与打开内容流 | `internal/files` |
-| `internal/syncclient` | 客户端单向拉取同步：通过 HTTP API 认证用户并拉取变更、计算确定性本地命名、在 `os.Root` 限制内安全应用与原子提交清单 | 无 |
+| `internal/syncclient` | 客户端拉取同步与单文件显式内容推送：通过 HTTP API 认证用户、拉取变更或以不透明 `ETag` 条件推送内容，在 `os.Root` 与目录锁限制内安全应用与原子提交清单 | 无 |
 | `internal/archcheck` | 在 `go test ./...` 中检查生产代码的直接导入 | 规则实现位于测试文件 |
 
 命令入口与架构测试包禁止被生产代码导入。HTTP 层禁止直接访问存储适配器、SQL、磁盘文件和进程配置。下载文件时，HTTP 层先认证会话并将用户 ID 传给 `internal/files`，从业务服务取得读取流后再写入响应。

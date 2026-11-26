@@ -20,14 +20,24 @@ const (
 	reservedLower = ".filedock"
 )
 
+// PendingPushRecord records an in-flight content push so a lost HTTP response can be verified on retry.
+type PendingPushRecord struct {
+	FileID       string `json:"file_id"`
+	BaseRevision int64  `json:"base_revision"`
+	BaseSHA256   string `json:"base_sha256"`
+	TargetSHA256 string `json:"target_sha256"`
+	TargetSize   int64  `json:"target_size"`
+}
+
 // State is the local sync manifest persisted inside .filedock/state.json (never stores tokens).
 type State struct {
-	Version   int                     `json:"version"`
-	ServerURL string                  `json:"server_url"`
-	UserID    string                  `json:"user_id"`
-	Cursor    int64                   `json:"cursor"`
-	Folders   map[string]FolderRecord `json:"folders"`
-	Files     map[string]FileRecord   `json:"files"`
+	Version     int                     `json:"version"`
+	ServerURL   string                  `json:"server_url"`
+	UserID      string                  `json:"user_id"`
+	Cursor      int64                   `json:"cursor"`
+	Folders     map[string]FolderRecord `json:"folders"`
+	Files       map[string]FileRecord   `json:"files"`
+	PendingPush *PendingPushRecord      `json:"pending_push,omitempty"`
 }
 
 // FolderRecord tracks a synced folder by stable server ID and its assigned relative local path.

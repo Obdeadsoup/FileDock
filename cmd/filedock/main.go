@@ -20,15 +20,26 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
-	if len(args) < 2 || args[0] != "sync" || args[1] != "pull" {
-		return errors.New("usage: filedock sync pull --server <URL> --dir <local-dir>")
+	if len(args) < 2 || args[0] != "sync" {
+		return errors.New("usage: filedock sync <pull|push> --server <URL> --dir <local-dir> [--path <rel-path>]")
 	}
 
+	switch args[1] {
+	case "pull":
+		return runSyncPull(ctx, args[2:], stdout)
+	case "push":
+		return runSyncPush(ctx, args[2:], stdout)
+	default:
+		return fmt.Errorf("unknown sync subcommand %q (expected pull or push)", args[1])
+	}
+}
+
+func runSyncPull(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("sync pull", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	serverURL := fs.String("server", "", "FileDock server base URL")
 	dir := fs.String("dir", "", "local mirror directory")
-	if err := fs.Parse(args[2:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
 	if fs.NArg() > 0 {
@@ -59,6 +70,54 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		res.Downloaded,
 		res.Reused,
 		res.Deleted,
+	)
+	return nil
+}
+
+func runSyncPush(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("sync push", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverURL := fs.String("server", "", "FileDock server base URL")
+	dir := fs.String("dir", "", "local mirror directory")
+	relPath := fs.String("path", "", "relative path of tracked file inside mirror directory")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+
+	token := strings.TrimSpace(os.Getenv("FILEDOCK_TOKEN"))
+	if token == "" {
+		return errors.New("FILEDOCK_TOKEN environment variable is required")
+	}
+
+	res, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: *serverURL,
+		Token:     token,
+		Dir:       *dir,
+		RelPath:   *relPath,
+	})
+	if err != nil {
+		return err
+	}
+
+	status := "pushed"
+	if res.Skipped {
+		status = "unchanged"
+	} else if res.Recovered {
+		status = "recovered"
+	}
+	_, _ = fmt.Fprintf(
+		stdout,
+		"%s file=%s path=%s revision=%d->%d sha256=%s cursor=%d\n",
+		status,
+		res.FileID,
+		res.LocalPath,
+		res.OldRevision,
+		res.NewRevision,
+		res.SHA256,
+		res.Cursor,
 	)
 	return nil
 }

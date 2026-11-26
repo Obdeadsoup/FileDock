@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"example.com/filedock/internal/files"
@@ -52,6 +53,8 @@ func (h *handler) replaceFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("ETag", files.ContentETag(updated))
+	w.Header().Set("X-FileDock-Content-Revision", strconv.FormatInt(updated.ContentRevision, 10))
+	w.Header().Set("X-FileDock-SHA256", updated.SHA256)
 	writeJSON(w, http.StatusOK, toFileResponse(updated))
 }
 

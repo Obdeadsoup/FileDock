@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,9 +19,20 @@ const (
 )
 
 var (
-	ErrUnauthorized = errors.New("unauthorized: check FILEDOCK_TOKEN")
-	ErrNotFound     = errors.New("resource not found on server")
+	ErrUnauthorized         = errors.New("unauthorized: check FILEDOCK_TOKEN")
+	ErrNotFound             = errors.New("resource not found on server")
+	ErrPreconditionFailed   = errors.New("precondition failed on server (HTTP 412)")
+	ErrPreconditionRequired = errors.New("precondition required on server (HTTP 428)")
+	ErrPayloadTooLarge      = errors.New("file exceeds server maximum size (HTTP 413)")
 )
+
+// RemoteContentInfo describes the current remote version metadata returned by HEAD /api/v1/files/{id}/content.
+type RemoteContentInfo struct {
+	ETag            string
+	ContentRevision int64
+	SHA256          string
+	Size            int64
+}
 
 // UserInfo represents the authenticated user returned by GET /api/v1/auth/me.
 type UserInfo struct {
@@ -65,11 +77,13 @@ type ChangePage struct {
 	HasMore    bool          `json:"has_more"`
 }
 
-// API defines the server operations required by the pull sync client.
+// API defines the server operations required by the sync client.
 type API interface {
 	Me(ctx context.Context) (UserInfo, error)
 	ListChanges(ctx context.Context, after int64, limit int) (ChangePage, error)
 	DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, error)
+	HeadFile(ctx context.Context, fileID string) (RemoteContentInfo, error)
+	ReplaceFileContent(ctx context.Context, fileID, ifMatch string, body io.Reader, contentLength int64) (FileMeta, string, error)
 }
 
 // HTTPAPI implements API over HTTP using a Bearer token.
@@ -195,12 +209,74 @@ func (a *HTTPAPI) DownloadFile(ctx context.Context, fileID string) (io.ReadClose
 	return resp.Body, nil
 }
 
+// HeadFile inspects remote opaque ETag, content revision, and SHA-256 via HEAD /api/v1/files/{id}/content.
+func (a *HTTPAPI) HeadFile(ctx context.Context, fileID string) (RemoteContentInfo, error) {
+	endpoint := "/api/v1/files/" + url.PathEscape(fileID) + "/content"
+	req, err := a.newRequest(ctx, http.MethodHead, endpoint)
+	if err != nil {
+		return RemoteContentInfo{}, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return RemoteContentInfo{}, fmt.Errorf("HEAD %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return RemoteContentInfo{}, statusError(resp.StatusCode, endpoint)
+	}
+
+	rev, _ := strconv.ParseInt(strings.TrimSpace(resp.Header.Get("X-FileDock-Content-Revision")), 10, 64)
+	size, _ := strconv.ParseInt(strings.TrimSpace(resp.Header.Get("Content-Length")), 10, 64)
+	return RemoteContentInfo{
+		ETag:            strings.TrimSpace(resp.Header.Get("ETag")),
+		ContentRevision: rev,
+		SHA256:          strings.TrimSpace(resp.Header.Get("X-FileDock-SHA256")),
+		Size:            size,
+	}, nil
+}
+
+// ReplaceFileContent streams body to PUT /api/v1/files/{id}/content with an opaque If-Match ETag.
+func (a *HTTPAPI) ReplaceFileContent(ctx context.Context, fileID, ifMatch string, body io.Reader, contentLength int64) (FileMeta, string, error) {
+	endpoint := "/api/v1/files/" + url.PathEscape(fileID) + "/content"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, a.baseURL+endpoint, body)
+	if err != nil {
+		return FileMeta{}, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+	req.Header.Set("If-Match", ifMatch)
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return FileMeta{}, "", fmt.Errorf("PUT %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return FileMeta{}, "", statusError(resp.StatusCode, endpoint)
+	}
+	var updated FileMeta
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseSize)).Decode(&updated); err != nil {
+		return FileMeta{}, "", fmt.Errorf("decode PUT %s: %w", endpoint, err)
+	}
+	return updated, strings.TrimSpace(resp.Header.Get("ETag")), nil
+}
+
 func statusError(code int, endpoint string) error {
 	switch code {
 	case http.StatusUnauthorized:
 		return ErrUnauthorized
 	case http.StatusNotFound:
 		return fmt.Errorf("%w: %s", ErrNotFound, endpoint)
+	case http.StatusPreconditionFailed:
+		return fmt.Errorf("%w: %s", ErrPreconditionFailed, endpoint)
+	case http.StatusPreconditionRequired:
+		return fmt.Errorf("%w: %s", ErrPreconditionRequired, endpoint)
+	case http.StatusRequestEntityTooLarge:
+		return fmt.Errorf("%w: %s", ErrPayloadTooLarge, endpoint)
 	default:
 		return fmt.Errorf("server returned HTTP %d for %s", code, endpoint)
 	}

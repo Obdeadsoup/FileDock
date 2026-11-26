@@ -68,6 +68,10 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
 		return Result{}, fmt.Errorf("ensure mirror directory: %w", err)
 	}
+
+	unlockInProc := lockDirInProcess(cfg.Dir)
+	defer unlockInProc()
+
 	root, err := os.OpenRoot(cfg.Dir)
 	if err != nil {
 		return Result{}, fmt.Errorf("open confined mirror root: %w", err)
@@ -89,6 +93,24 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}
 
+	if err := ensureMetaDirs(root); err != nil {
+		return Result{}, err
+	}
+	unlockFile, err := lockMirrorFile(root)
+	if err != nil {
+		return Result{}, err
+	}
+	defer unlockFile()
+
+	// Re-load state under the mirror file lock in case another process committed while we waited.
+	state, exists, err = loadState(root)
+	if err != nil {
+		return Result{}, err
+	}
+	if exists && state.ServerURL != normalizedServer {
+		return Result{}, fmt.Errorf("%w: local=%q requested=%q", ErrServerMismatch, state.ServerURL, normalizedServer)
+	}
+
 	me, err := api.Me(ctx)
 	if err != nil {
 		return Result{}, err
@@ -96,21 +118,13 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 
 	if !exists {
 		state = newEmptyState(normalizedServer, me.ID)
-		if err := ensureMetaDirs(root); err != nil {
-			return Result{}, err
-		}
 		// Persist initial bound state (cursor 0) before any mirror mutation so an interrupted
 		// first pull can safely resume without being rejected as a non-empty directory.
 		if err := saveStateAtomically(root, state); err != nil {
 			return Result{}, err
 		}
-	} else {
-		if state.UserID != me.ID {
-			return Result{}, fmt.Errorf("%w: local=%q authenticated=%q", ErrUserMismatch, state.UserID, me.ID)
-		}
-		if err := ensureMetaDirs(root); err != nil {
-			return Result{}, err
-		}
+	} else if state.UserID != me.ID {
+		return Result{}, fmt.Errorf("%w: local=%q authenticated=%q", ErrUserMismatch, state.UserID, me.ID)
 	}
 
 	pageLimit := cfg.PageLimit
@@ -445,12 +459,13 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 
 	// 10. Atomically commit updated manifest and cursor.
 	nextState := State{
-		Version:   stateVersion,
-		ServerURL: normalizedServer,
-		UserID:    me.ID,
-		Cursor:    cursor,
-		Folders:   targetFolders,
-		Files:     targetFiles,
+		Version:     stateVersion,
+		ServerURL:   normalizedServer,
+		UserID:      me.ID,
+		Cursor:      cursor,
+		Folders:     targetFolders,
+		Files:       targetFiles,
+		PendingPush: state.PendingPush,
 	}
 	if err := saveStateAtomically(root, nextState); err != nil {
 		return Result{}, err
@@ -653,7 +668,21 @@ func ensureFirstRunEmptyDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("inspect mirror directory: %w", err)
 	}
-	if len(entries) > 0 {
+	for _, entry := range entries {
+		if entry.Name() == metaDirName && entry.IsDir() {
+			// Allow a leftover .filedock containing only tmp/ or lock from a previously interrupted initial pull.
+			metaEntries, err := os.ReadDir(dir + "/" + metaDirName)
+			if err != nil {
+				return fmt.Errorf("inspect %s directory: %w", metaDirName, err)
+			}
+			for _, me := range metaEntries {
+				if (me.Name() == "tmp" && me.IsDir()) || (me.Name() == "lock" && !me.IsDir()) {
+					continue
+				}
+				return fmt.Errorf("%w: %s", ErrDirNotEmpty, dir)
+			}
+			continue
+		}
 		return fmt.Errorf("%w: %s", ErrDirNotEmpty, dir)
 	}
 	return nil

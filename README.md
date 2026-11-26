@@ -250,7 +250,7 @@ FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.
 
 ### 首次运行与本地状态规则
 
-- **首次接管空目录**：目标目录不存在时自动创建；若目录非空且尚未初始化 `.filedock/state.json`，客户端直接报错退出，不接管已有文件。首次拉取在修改镜像目录前即先持久化与 `server_url`、`user_id` 绑定的初始状态（`cursor = 0`），因此即使首次发布文件后中途崩溃，重跑也可安全恢复收敛。
+- **首次接管空目录**：目标目录不存在时自动创建；若目录非空且尚未初始化 `.filedock/state.json`，客户端直接报错退出，不接管已有文件（若仅残留中断首次拉取留下的 `.filedock/tmp`，重跑可自动恢复）。首次拉取在修改镜像目录前即先持久化与 `server_url`、`user_id` 绑定的初始状态（`cursor = 0`），因此即使首次发布文件后中途崩溃，重跑也可安全恢复收敛。
 - **状态绑定与安全**：客户端在镜像目录内通过 `os.Root` 受限根目录操作所有文件，将 `server_url`、`user_id`（来自 `GET /api/v1/auth/me`）、`cursor` 与按资源 ID 索引的清单原子写入 `.filedock/state.json`；**Bearer 令牌仅从环境变量 `FILEDOCK_TOKEN` 读取，不写入状态文件或日志**。服务端地址或用户不匹配时明确报错。
 - **本地命名映射规则**：
   - 同一父目录下名称唯一（按大小写折叠比较）且不与 `.filedock` 冲突的条目，保留原始名称。
@@ -287,6 +287,21 @@ FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.
 (cd /tmp/mirror-a && find . -path './.filedock' -prune -o -type f -print | sort | xargs shasum -a 256)
 (cd /tmp/mirror-b && find . -path './.filedock' -prune -o -type f -print | sort | xargs shasum -a 256)
 ```
+
+### 显式内容推送（`filedock sync push`）
+
+针对已同步清单中跟踪的单个普通文件，可将本地编辑按基线版本条件推送回服务端：
+
+```sh
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync push \
+  --server http://127.0.0.1:8080 \
+  --dir /tmp/mirror-a \
+  --path README-final.txt
+```
+
+- 客户端先对本地文件生成临时快照并计算 SHA-256（无改动直接跳过上传），再通过 `HEAD /api/v1/files/{id}/content` 核对远端版本与哈希匹配本地基线后，将服务端返回的不透明 `ETag` 作为 `If-Match` 提交 `PUT /api/v1/files/{id}/content`。
+- 推送成功后原子更新清单中该文件的哈希与 `content_revision`，**保持全局拉取游标 `cursor` 不变**，确保后续 `pull` 仍能读取本次更新与其他设备的变更。
+- 若遇到 `412` 版本冲突、远端文件已删除或旧清单缺少 `content_revision` 基线，客户端明确报错并原样保留本地文件与原清单，不会自动换用最新 `ETag` 覆盖。同一镜像目录的 `pull` 和 `push` 通过目录锁串行执行。
 
 ## 旧数据迁移与显式认领
 

@@ -13,6 +13,9 @@ func TestCLIValidation(t *testing.T) {
 	}
 	t.Setenv("FILEDOCK_TOKEN", "")
 	if err := run(context.Background(), []string{"sync", "pull", "--server", "http://127.0.0.1:8080", "--dir", t.TempDir()}, &out); err == nil {
-		t.Fatal("expected error when FILEDOCK_TOKEN is empty")
+		t.Fatal("expected error when FILEDOCK_TOKEN is empty for pull")
+	}
+	if err := run(context.Background(), []string{"sync", "push", "--server", "http://127.0.0.1:8080", "--dir", t.TempDir(), "--path", "a.txt"}, &out); err == nil {
+		t.Fatal("expected error when FILEDOCK_TOKEN is empty for push")
 	}
 }
