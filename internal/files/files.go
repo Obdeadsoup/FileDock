@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -62,6 +63,7 @@ type ListPage struct {
 
 // BlobStore manages raw file content streams on storage.
 type BlobStore interface {
+	ChunkStore
 	Save(ctx context.Context, r io.Reader, maxBytes int64) (StagedBlob, error)
 	Open(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	Delete(ctx context.Context, objectKey string) error
@@ -74,6 +76,7 @@ type MetadataStore interface {
 	ShareStore
 	SyncStore
 	ContentUpdateStore
+	UploadSessionStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
@@ -84,14 +87,20 @@ type IDGenerator func() (string, error)
 
 // Service coordinates file validation, content storage, and owner-scoped metadata persistence.
 type Service struct {
-	blobs            BlobStore
-	meta             MetadataStore
-	idGen            IDGenerator
-	maxFileSize      int64
-	now              func() time.Time
-	cleanupNotify    chan struct{}
-	cleanupBaseDelay time.Duration
-	cleanupMaxDelay  time.Duration
+	blobs             BlobStore
+	meta              MetadataStore
+	idGen             IDGenerator
+	maxFileSize       int64
+	uploadChunkSize   int64
+	uploadSessionTTL  time.Duration
+	maxActiveSessions int
+	maxStagingBytes   int64
+	now               func() time.Time
+	cleanupNotify     chan struct{}
+	cleanupBaseDelay  time.Duration
+	cleanupMaxDelay   time.Duration
+	uploadMuGuard     sync.Mutex
+	uploadSessionMu   map[string]*sync.Mutex
 }
 
 // Option configures optional settings on Service.
@@ -136,14 +145,18 @@ func NewService(blobs BlobStore, meta MetadataStore, idGen IDGenerator, opts ...
 		return nil, errors.New("id generator is required")
 	}
 	s := &Service{
-		blobs:            blobs,
-		meta:             meta,
-		idGen:            idGen,
-		maxFileSize:      DefaultMaxFileSize,
-		now:              func() time.Time { return time.Now().UTC() },
-		cleanupNotify:    make(chan struct{}, 1),
-		cleanupBaseDelay: defaultCleanupBaseDelay,
-		cleanupMaxDelay:  defaultCleanupMaxDelay,
+		blobs:             blobs,
+		meta:              meta,
+		idGen:             idGen,
+		maxFileSize:       DefaultMaxFileSize,
+		uploadChunkSize:   DefaultUploadChunkSize,
+		uploadSessionTTL:  DefaultUploadSessionTTL,
+		maxActiveSessions: DefaultMaxActiveUploadSessions,
+		maxStagingBytes:   DefaultMaxUploadStagingBytes,
+		now:               func() time.Time { return time.Now().UTC() },
+		cleanupNotify:     make(chan struct{}, 1),
+		cleanupBaseDelay:  defaultCleanupBaseDelay,
+		cleanupMaxDelay:   defaultCleanupMaxDelay,
 	}
 	for _, opt := range opts {
 		if opt != nil {

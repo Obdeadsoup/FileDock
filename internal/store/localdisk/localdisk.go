@@ -18,24 +18,30 @@ import (
 type Store struct {
 	objectsDir string
 	tmpDir     string
+	uploadsDir string
 }
 
-// NewStore initializes object and staging directories under dataDir.
+// NewStore initializes object, staging, and chunk upload directories under dataDir.
 func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {
 		return nil, errors.New("data dir must not be empty")
 	}
 	objectsDir := filepath.Join(dataDir, "objects")
 	tmpDir := filepath.Join(dataDir, "tmp")
+	uploadsDir := filepath.Join(dataDir, "uploads")
 	if err := os.MkdirAll(objectsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create objects dir: %w", err)
 	}
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create tmp dir: %w", err)
 	}
+	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create uploads dir: %w", err)
+	}
 	return &Store{
 		objectsDir: objectsDir,
 		tmpDir:     tmpDir,
+		uploadsDir: uploadsDir,
 	}, nil
 }
 

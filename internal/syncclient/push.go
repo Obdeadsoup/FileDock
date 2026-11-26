@@ -146,10 +146,7 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 
 	// Skip upload if content has not changed relative to local baseline.
 	if snapSHA == rec.SHA256 {
-		if state.PendingPush != nil && state.PendingPush.FileID == rec.ID {
-			state.PendingPush = nil
-			_ = saveStateAtomically(root, state)
-		}
+		clearPendingPushIfMatches(root, &state, rec.ID)
 		return PushResult{
 			UserID:      me.ID,
 			FileID:      rec.ID,
@@ -177,11 +174,12 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 	if remoteInfo.ContentRevision != rec.ContentRevision || remoteInfo.SHA256 != rec.SHA256 {
 		// Response-loss recovery: if a prior push of this exact snapshot already committed on the server,
 		// verify remote matches (baseRevision+1, snapSHA) and record success without re-uploading.
-		if isConfirmedPendingPush(state.PendingPush, rec, snapSHA, remoteInfo) {
+		if pending, ok := state.PendingPushes[rec.ID]; ok && isConfirmedPendingPush(&pending, rec, snapSHA, remoteInfo) {
 			rec.SHA256 = remoteInfo.SHA256
 			rec.Size = remoteInfo.Size
 			rec.ContentRevision = remoteInfo.ContentRevision
 			state.Files[rec.ID] = rec
+			delete(state.PendingPushes, rec.ID)
 			state.PendingPush = nil
 			if err := saveStateAtomically(root, state); err != nil {
 				return PushResult{}, err
@@ -211,14 +209,18 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 		return PushResult{}, errors.New("server HEAD response did not include an ETag")
 	}
 
-	// Record pending push intent before sending PUT so a lost response can be safely recovered on retry.
-	state.PendingPush = &PendingPushRecord{
+	// Record pending push intent per file ID before sending PUT so a lost response can be safely recovered on retry.
+	if state.PendingPushes == nil {
+		state.PendingPushes = make(map[string]PendingPushRecord)
+	}
+	state.PendingPushes[rec.ID] = PendingPushRecord{
 		FileID:       rec.ID,
 		BaseRevision: rec.ContentRevision,
 		BaseSHA256:   rec.SHA256,
 		TargetSHA256: snapSHA,
 		TargetSize:   snapSize,
 	}
+	state.PendingPush = nil
 	if err := saveStateAtomically(root, state); err != nil {
 		return PushResult{}, err
 	}
@@ -238,7 +240,7 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 			clearPendingPushIfMatches(root, &state, rec.ID)
 			return PushResult{}, fmt.Errorf("%w: %s (id=%s)", ErrRemoteDeleted, relPath, rec.ID)
 		}
-		// Keep PendingPush recorded on uncertain/transport error so retry can verify if server committed.
+		// Keep PendingPushes[rec.ID] recorded on uncertain/transport error so retry can verify if server committed.
 		return PushResult{}, putErr
 	}
 
@@ -247,6 +249,7 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 	rec.Size = updated.Size
 	rec.ContentRevision = updated.ContentRevision
 	state.Files[rec.ID] = rec
+	delete(state.PendingPushes, rec.ID)
 	state.PendingPush = nil
 
 	// Keep state.Cursor unchanged so subsequent pull still observes this and other devices' events.
@@ -279,8 +282,16 @@ func isConfirmedPendingPush(pending *PendingPushRecord, rec FileRecord, snapSHA 
 }
 
 func clearPendingPushIfMatches(root *os.Root, state *State, fileID string) {
+	changed := false
+	if _, ok := state.PendingPushes[fileID]; ok {
+		delete(state.PendingPushes, fileID)
+		changed = true
+	}
 	if state.PendingPush != nil && state.PendingPush.FileID == fileID {
 		state.PendingPush = nil
+		changed = true
+	}
+	if changed {
 		_ = saveStateAtomically(root, *state)
 	}
 }

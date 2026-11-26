@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口、Go 命令行客户端单向拉取同步（`cmd/filedock`），以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分块上传与断点续传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口、Go 命令行客户端拉取同步/显式推送/断点续传上传（`cmd/filedock`），以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。双向编辑冲突、收到的共享同步、后台轮询、断点续传与 GUI 留待后续轮次。
+> 当前以本机 HTTP 为开发与验收环境。收到的共享同步、后台轮询与 GUI 留待后续轮次。
 
 ## 启动服务
 
@@ -129,6 +129,10 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `GET /api/v1/shares/{share_id}/files` | 接收者浏览共享目录的直接文件（支持 `parent_id`、`limit`、`offset`）或查看单文件共享条目。 |
 | `GET /api/v1/shares/{share_id}/files/{file_id}/content` | 接收者按 `share_id` 流式下载单独共享的文件或共享目录子树内的文件（不暴露外部父目录和 `object_key`）。 |
 | `GET /api/v1/sync/changes` | 可选查询参数 `after`（排他游标，默认 `0`）、`limit`（默认 `50`，最大 `100`）。按当前用户独立递增 `seq` 升序返回 `items`、`next_cursor`、`has_more`。 |
+| `POST /api/v1/uploads` | JSON `{"parent_id":null,"name":"big.bin","size":50331648,"sha256":"..."}`。创建分块上传会话，返回 `201`、会话 ID 与服务端分配的 `chunk_size`（默认 4 MiB）和 `total_chunks`。 |
+| `GET /api/v1/uploads/{id}` | 按所有者查询上传会话状态与已确认分块列表 `uploaded_chunks`（重启后持久可查；跨账号返回 `404`，过期返回 `410`）。 |
+| `PUT /api/v1/uploads/{id}/chunks/{index}` | 流式上传指定编号分块，可选 `X-Chunk-SHA256` 头校验。重复提交相同内容幂等返回 `200`，内容不同返回 `409`。 |
+| `POST /api/v1/uploads/{id}/complete` | 按编号流式组装并校验总大小与整文件 SHA-256；通过后在同一事务内登记新文件与一条 `file.upsert` 并清理分块。并发或重试完成幂等返回同一个文件 ID。 |
 | `GET /api/v1/auth/me` | 需有效 Bearer 令牌。返回当前会话用户 `id`、`username`、`created_at`，供同步客户端校验本地状态绑定。 |
 
 两个列表都按创建时间降序、ID 升序排列。默认 `limit=50`、`offset=0`，每页最多 100 条，空结果为 `[]`。
@@ -301,7 +305,28 @@ FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync push \
 
 - 客户端先对本地文件生成临时快照并计算 SHA-256（无改动直接跳过上传），再通过 `HEAD /api/v1/files/{id}/content` 核对远端版本与哈希匹配本地基线后，将服务端返回的不透明 `ETag` 作为 `If-Match` 提交 `PUT /api/v1/files/{id}/content`。
 - 推送成功后原子更新清单中该文件的哈希与 `content_revision`，**保持全局拉取游标 `cursor` 不变**，确保后续 `pull` 仍能读取本次更新与其他设备的变更。
-- 若遇到 `412` 版本冲突、远端文件已删除或旧清单缺少 `content_revision` 基线，客户端明确报错并原样保留本地文件与原清单，不会自动换用最新 `ETag` 覆盖。同一镜像目录的 `pull` 和 `push` 通过目录锁串行执行。
+- 若遇到 `412` 版本冲突、远端文件已删除或旧清单缺少 `content_revision` 基线，客户端明确报错并原样保留本地文件与原清单，不会自动换用最新 `ETag` 覆盖。待确认推送按文件 ID 分别记录（兼容读取旧单条 `pending_push`），同一镜像目录的 `pull` 和 `push` 通过目录锁串行执行。
+
+### 分块上传与断点续传（`filedock upload`）
+
+使用 `filedock upload` 分块上传新文件，开始传输前即输出 `session=<ID>`；中断或服务端重启后传入 `--session <ID>` 即可只补传未确认分块：
+
+```sh
+# 发起分块上传（可通过 --parent-id 指定目标目录）
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock upload \
+  --server http://127.0.0.1:8080 \
+  --file /tmp/sample48m.bin \
+  --parent-id "$DIR_ID"
+
+# 中断后凭会话 ID 断点续传（会先校验本地源文件大小与 SHA-256 仍匹配会话）
+FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock upload \
+  --server http://127.0.0.1:8080 \
+  --file /tmp/sample48m.bin \
+  --session "$SESSION_ID"
+```
+
+- 分块字节存放在数据目录独立暂存区 `uploads/<session_id>/`，会话与已确认分块持久化在 SQLite，后台清理任务定期回收已过期未完成会话的暂存分块与记录。
+- 完成上传时在写事务外流式组装并校验整文件大小和 SHA-256，校验通过后在同一 SQLite 事务中登记文件、追加单条 `file.upsert` 并保留完成结果以支持重试幂等。
 
 ## 旧数据迁移与显式认领
 

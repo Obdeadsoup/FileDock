@@ -1,6 +1,7 @@
 package syncclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,7 +25,27 @@ var (
 	ErrPreconditionFailed   = errors.New("precondition failed on server (HTTP 412)")
 	ErrPreconditionRequired = errors.New("precondition required on server (HTTP 428)")
 	ErrPayloadTooLarge      = errors.New("file exceeds server maximum size (HTTP 413)")
+	ErrServerConflict       = errors.New("conflict on server (HTTP 409)")
+	ErrSessionExpired       = errors.New("upload session expired on server (HTTP 410)")
 )
+
+// UploadSessionInfo represents upload session progress returned by /api/v1/uploads.
+type UploadSessionInfo struct {
+	ID             string     `json:"id"`
+	Name           string     `json:"name"`
+	ParentID       *string    `json:"parent_id"`
+	Size           int64      `json:"size"`
+	SHA256         string     `json:"sha256"`
+	ChunkSize      int64      `json:"chunk_size"`
+	TotalChunks    int        `json:"total_chunks"`
+	Status         string     `json:"status"`
+	UploadedChunks []int      `json:"uploaded_chunks"`
+	UploadedBytes  int64      `json:"uploaded_bytes"`
+	FileID         *string    `json:"file_id"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      time.Time  `json:"expires_at"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+}
 
 // RemoteContentInfo describes the current remote version metadata returned by HEAD /api/v1/files/{id}/content.
 type RemoteContentInfo struct {
@@ -84,6 +105,10 @@ type API interface {
 	DownloadFile(ctx context.Context, fileID string) (io.ReadCloser, error)
 	HeadFile(ctx context.Context, fileID string) (RemoteContentInfo, error)
 	ReplaceFileContent(ctx context.Context, fileID, ifMatch string, body io.Reader, contentLength int64) (FileMeta, string, error)
+	CreateUploadSession(ctx context.Context, parentID *string, name string, size int64, sha256Hex string) (UploadSessionInfo, error)
+	GetUploadSession(ctx context.Context, sessionID string) (UploadSessionInfo, error)
+	UploadChunk(ctx context.Context, sessionID string, index int, chunkSHA256 string, body io.Reader, contentLength int64) error
+	CompleteUploadSession(ctx context.Context, sessionID string) (FileMeta, error)
 }
 
 // HTTPAPI implements API over HTTP using a Bearer token.
@@ -265,12 +290,130 @@ func (a *HTTPAPI) ReplaceFileContent(ctx context.Context, fileID, ifMatch string
 	return updated, strings.TrimSpace(resp.Header.Get("ETag")), nil
 }
 
+// CreateUploadSession calls POST /api/v1/uploads to start a new resumable upload session.
+func (a *HTTPAPI) CreateUploadSession(ctx context.Context, parentID *string, name string, size int64, sha256Hex string) (UploadSessionInfo, error) {
+	payload := struct {
+		ParentID *string `json:"parent_id"`
+		Name     string  `json:"name"`
+		Size     int64   `json:"size"`
+		SHA256   string  `json:"sha256"`
+	}{
+		ParentID: parentID,
+		Name:     name,
+		Size:     size,
+		SHA256:   sha256Hex,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/api/v1/uploads", bytes.NewReader(raw))
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return UploadSessionInfo{}, fmt.Errorf("POST /api/v1/uploads: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return UploadSessionInfo{}, statusError(resp.StatusCode, "/api/v1/uploads")
+	}
+	var session UploadSessionInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseSize)).Decode(&session); err != nil {
+		return UploadSessionInfo{}, fmt.Errorf("decode POST /api/v1/uploads: %w", err)
+	}
+	return session, nil
+}
+
+// GetUploadSession calls GET /api/v1/uploads/{id} to inspect confirmed chunks and session metadata.
+func (a *HTTPAPI) GetUploadSession(ctx context.Context, sessionID string) (UploadSessionInfo, error) {
+	endpoint := "/api/v1/uploads/" + url.PathEscape(sessionID)
+	req, err := a.newRequest(ctx, http.MethodGet, endpoint)
+	if err != nil {
+		return UploadSessionInfo{}, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return UploadSessionInfo{}, fmt.Errorf("GET %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return UploadSessionInfo{}, statusError(resp.StatusCode, endpoint)
+	}
+	var session UploadSessionInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseSize)).Decode(&session); err != nil {
+		return UploadSessionInfo{}, fmt.Errorf("decode GET %s: %w", endpoint, err)
+	}
+	return session, nil
+}
+
+// UploadChunk streams a single chunk via PUT /api/v1/uploads/{id}/chunks/{index}.
+func (a *HTTPAPI) UploadChunk(ctx context.Context, sessionID string, index int, chunkSHA256 string, body io.Reader, contentLength int64) error {
+	endpoint := fmt.Sprintf("/api/v1/uploads/%s/chunks/%d", url.PathEscape(sessionID), index)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, a.baseURL+endpoint, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+	if chunkSHA256 != "" {
+		req.Header.Set("X-Chunk-SHA256", chunkSHA256)
+	}
+	if contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("PUT %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return statusError(resp.StatusCode, endpoint)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONResponseSize))
+	return nil
+}
+
+// CompleteUploadSession finalizes an upload session via POST /api/v1/uploads/{id}/complete.
+func (a *HTTPAPI) CompleteUploadSession(ctx context.Context, sessionID string) (FileMeta, error) {
+	endpoint := "/api/v1/uploads/" + url.PathEscape(sessionID) + "/complete"
+	req, err := a.newRequest(ctx, http.MethodPost, endpoint)
+	if err != nil {
+		return FileMeta{}, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return FileMeta{}, fmt.Errorf("POST %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return FileMeta{}, statusError(resp.StatusCode, endpoint)
+	}
+	var file FileMeta
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONResponseSize)).Decode(&file); err != nil {
+		return FileMeta{}, fmt.Errorf("decode POST %s: %w", endpoint, err)
+	}
+	return file, nil
+}
+
 func statusError(code int, endpoint string) error {
 	switch code {
 	case http.StatusUnauthorized:
 		return ErrUnauthorized
 	case http.StatusNotFound:
 		return fmt.Errorf("%w: %s", ErrNotFound, endpoint)
+	case http.StatusConflict:
+		return fmt.Errorf("%w: %s", ErrServerConflict, endpoint)
+	case http.StatusGone:
+		return fmt.Errorf("%w: %s", ErrSessionExpired, endpoint)
 	case http.StatusPreconditionFailed:
 		return fmt.Errorf("%w: %s", ErrPreconditionFailed, endpoint)
 	case http.StatusPreconditionRequired:

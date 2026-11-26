@@ -31,13 +31,15 @@ type PendingPushRecord struct {
 
 // State is the local sync manifest persisted inside .filedock/state.json (never stores tokens).
 type State struct {
-	Version     int                     `json:"version"`
-	ServerURL   string                  `json:"server_url"`
-	UserID      string                  `json:"user_id"`
-	Cursor      int64                   `json:"cursor"`
-	Folders     map[string]FolderRecord `json:"folders"`
-	Files       map[string]FileRecord   `json:"files"`
-	PendingPush *PendingPushRecord      `json:"pending_push,omitempty"`
+	Version       int                          `json:"version"`
+	ServerURL     string                       `json:"server_url"`
+	UserID        string                       `json:"user_id"`
+	Cursor        int64                        `json:"cursor"`
+	Folders       map[string]FolderRecord      `json:"folders"`
+	Files         map[string]FileRecord        `json:"files"`
+	PendingPushes map[string]PendingPushRecord `json:"pending_pushes,omitempty"`
+	// PendingPush is retained only for backward-compatible reading of legacy single-record state files.
+	PendingPush *PendingPushRecord `json:"pending_push,omitempty"`
 }
 
 // FolderRecord tracks a synced folder by stable server ID and its assigned relative local path.
@@ -92,6 +94,15 @@ func loadState(root *os.Root) (State, bool, error) {
 	}
 	if st.Files == nil {
 		st.Files = make(map[string]FileRecord)
+	}
+	if st.PendingPushes == nil {
+		st.PendingPushes = make(map[string]PendingPushRecord)
+	}
+	if st.PendingPush != nil && st.PendingPush.FileID != "" {
+		if _, exists := st.PendingPushes[st.PendingPush.FileID]; !exists {
+			st.PendingPushes[st.PendingPush.FileID] = *st.PendingPush
+		}
+		st.PendingPush = nil
 	}
 	return st, true, nil
 }

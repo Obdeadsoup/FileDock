@@ -167,6 +167,15 @@ func (s *Service) RunCleanupWorker(ctx context.Context, interval time.Duration, 
 				onError(err)
 			}
 			if acked < batchSize {
+				break
+			}
+		}
+		for ctx.Err() == nil {
+			cleaned, err := s.ProcessExpiredUploadSessions(ctx, batchSize)
+			if err != nil && onError != nil && ctx.Err() == nil {
+				onError(err)
+			}
+			if cleaned < batchSize {
 				return
 			}
 		}

@@ -299,3 +299,152 @@ func TestFirstPullRecoversWhenOnlyDotFiledockTmpExists(t *testing.T) {
 		t.Fatalf("stranger file not preserved: %q err=%v", got, err)
 	}
 }
+
+func TestPushPendingPerFileInterleavedAndLegacyCompat(t *testing.T) {
+	ts := startTestServer(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	fileA := ts.uploadFile(t, ts.tokenA, nil, "a.txt", []byte("a-v1"))
+	_ = ts.uploadFile(t, ts.tokenA, nil, "b.txt", []byte("b-v1"))
+
+	pullRes, err := syncclient.Pull(ctx, syncclient.Config{ServerURL: ts.srv.URL, Token: ts.tokenA, Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aV2 := []byte("a-v2 committed before drop")
+	bV2 := []byte("b-v2 pushed while A pending")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), aV2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), bV2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	httpAPI, err := syncclient.NewHTTPAPI(ts.srv.URL, ts.tokenA, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putCounts := make(map[string]int)
+	flaky := &perFileDropAPI{
+		API:       httpAPI,
+		dropOnce:  map[string]bool{fileA: true},
+		putCounts: putCounts,
+	}
+
+	// 1. Push A commits on server but drops HTTP response.
+	if _, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: ts.srv.URL,
+		Dir:       dir,
+		RelPath:   "a.txt",
+		API:       flaky,
+	}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("first Push(a.txt) error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if putCounts[fileA] != 1 {
+		t.Fatalf("putCounts[A] = %d, want 1", putCounts[fileA])
+	}
+
+	// 2. Push B succeeds while A's pending push is still unconfirmed.
+	resB, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: ts.srv.URL,
+		Dir:       dir,
+		RelPath:   "b.txt",
+		API:       flaky,
+	})
+	if err != nil {
+		t.Fatalf("Push(b.txt) error = %v", err)
+	}
+	if resB.Recovered || resB.OldRevision != 1 || resB.NewRevision != 2 || resB.Cursor != pullRes.EndCursor {
+		t.Fatalf("Push(b.txt) = %+v, want normal rev=1->2 cursor=%d", resB, pullRes.EndCursor)
+	}
+
+	// 3. Retry Push A -> confirms existing commit without uploading A again, keeping cursor unchanged.
+	resA, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: ts.srv.URL,
+		Dir:       dir,
+		RelPath:   "a.txt",
+		API:       flaky,
+	})
+	if err != nil {
+		t.Fatalf("retry Push(a.txt) error = %v", err)
+	}
+	if !resA.Recovered || resA.OldRevision != 1 || resA.NewRevision != 2 || resA.Cursor != pullRes.EndCursor {
+		t.Fatalf("retry Push(a.txt) = %+v, want Recovered=true rev=1->2 cursor=%d", resA, pullRes.EndCursor)
+	}
+	if putCounts[fileA] != 1 {
+		t.Fatalf("putCounts[A] after retry = %d, want 1 (no re-upload)", putCounts[fileA])
+	}
+
+	// 4. Backward compatibility: legacy single "pending_push" JSON field is read and recovered.
+	aV3 := []byte("a-v3 legacy pending_push recovery")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), aV3, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flaky.dropOnce[fileA] = true
+	if _, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: ts.srv.URL,
+		Dir:       dir,
+		RelPath:   "a.txt",
+		API:       flaky,
+	}); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("Push(a.txt v3) error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	// Rewrite state.json to legacy single-field pending_push format.
+	statePath := filepath.Join(dir, ".filedock", "state.json")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	pendingMap, _ := doc["pending_pushes"].(map[string]any)
+	legacyEntry, ok := pendingMap[fileA]
+	if !ok {
+		t.Fatalf("expected pending_pushes[%s] in state.json", fileA)
+	}
+	delete(doc, "pending_pushes")
+	doc["pending_push"] = legacyEntry
+	legacyRaw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, legacyRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resLegacy, err := syncclient.Push(ctx, syncclient.PushConfig{
+		ServerURL: ts.srv.URL,
+		Dir:       dir,
+		RelPath:   "a.txt",
+		API:       flaky,
+	})
+	if err != nil {
+		t.Fatalf("legacy pending_push recovery error = %v", err)
+	}
+	if !resLegacy.Recovered || resLegacy.OldRevision != 2 || resLegacy.NewRevision != 3 || putCounts[fileA] != 2 {
+		t.Fatalf("legacy recovery = %+v putCounts[A]=%d, want Recovered=true rev=2->3 putCounts=2", resLegacy, putCounts[fileA])
+	}
+}
+
+type perFileDropAPI struct {
+	syncclient.API
+	dropOnce  map[string]bool
+	putCounts map[string]int
+}
+
+func (p *perFileDropAPI) ReplaceFileContent(ctx context.Context, fileID, ifMatch string, body io.Reader, contentLength int64) (syncclient.FileMeta, string, error) {
+	p.putCounts[fileID]++
+	updated, etag, err := p.API.ReplaceFileContent(ctx, fileID, ifMatch, body, contentLength)
+	if err != nil {
+		return updated, etag, err
+	}
+	if p.dropOnce[fileID] {
+		delete(p.dropOnce, fileID)
+		return syncclient.FileMeta{}, "", io.ErrUnexpectedEOF
+	}
+	return updated, etag, nil
+}

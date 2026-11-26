@@ -20,17 +20,27 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
-	if len(args) < 2 || args[0] != "sync" {
-		return errors.New("usage: filedock sync <pull|push> --server <URL> --dir <local-dir> [--path <rel-path>]")
+	if len(args) == 0 {
+		return errors.New("usage: filedock <sync pull|sync push|upload> [flags]")
 	}
 
-	switch args[1] {
-	case "pull":
-		return runSyncPull(ctx, args[2:], stdout)
-	case "push":
-		return runSyncPush(ctx, args[2:], stdout)
+	switch args[0] {
+	case "sync":
+		if len(args) < 2 {
+			return errors.New("usage: filedock sync <pull|push> --server <URL> --dir <local-dir> [--path <rel-path>]")
+		}
+		switch args[1] {
+		case "pull":
+			return runSyncPull(ctx, args[2:], stdout)
+		case "push":
+			return runSyncPush(ctx, args[2:], stdout)
+		default:
+			return fmt.Errorf("unknown sync subcommand %q (expected pull or push)", args[1])
+		}
+	case "upload":
+		return runUpload(ctx, args[1:], stdout)
 	default:
-		return fmt.Errorf("unknown sync subcommand %q (expected pull or push)", args[1])
+		return fmt.Errorf("unknown command %q (expected sync or upload)", args[0])
 	}
 }
 
@@ -118,6 +128,67 @@ func runSyncPush(ctx context.Context, args []string, stdout io.Writer) error {
 		res.NewRevision,
 		res.SHA256,
 		res.Cursor,
+	)
+	return nil
+}
+
+func runUpload(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("upload", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverURL := fs.String("server", "", "FileDock server base URL")
+	filePath := fs.String("file", "", "local file to upload")
+	parentID := fs.String("parent-id", "", "optional target folder ID on server")
+	sessionID := fs.String("session", "", "optional upload session ID to resume")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+
+	token := strings.TrimSpace(os.Getenv("FILEDOCK_TOKEN"))
+	if token == "" {
+		return errors.New("FILEDOCK_TOKEN environment variable is required")
+	}
+
+	var parentPtr *string
+	if trimmedParent := strings.TrimSpace(*parentID); trimmedParent != "" {
+		parentPtr = &trimmedParent
+	}
+
+	res, err := syncclient.Upload(ctx, syncclient.UploadConfig{
+		ServerURL: *serverURL,
+		Token:     token,
+		FilePath:  *filePath,
+		ParentID:  parentPtr,
+		SessionID: *sessionID,
+		OnSessionReady: func(session syncclient.UploadSessionInfo) {
+			_, _ = fmt.Fprintf(
+				stdout,
+				"session=%s file=%s size=%d chunks=%d chunk_size=%d confirmed=%d\n",
+				session.ID,
+				session.Name,
+				session.Size,
+				session.TotalChunks,
+				session.ChunkSize,
+				len(session.UploadedChunks),
+			)
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(
+		stdout,
+		"uploaded file=%s session=%s size=%d bytes_sent=%d chunks_sent=%d/%d sha256=%s\n",
+		res.File.ID,
+		res.SessionID,
+		res.File.Size,
+		res.BytesSent,
+		res.ChunksSent,
+		res.TotalChunks,
+		res.File.SHA256,
 	)
 	return nil
 }

@@ -458,14 +458,20 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 	}
 
 	// 10. Atomically commit updated manifest and cursor.
+	nextPending := make(map[string]PendingPushRecord, len(state.PendingPushes))
+	for id, rec := range state.PendingPushes {
+		if tf, stillExists := targetFiles[id]; stillExists && tf.ContentRevision == rec.BaseRevision && tf.SHA256 == rec.BaseSHA256 {
+			nextPending[id] = rec
+		}
+	}
 	nextState := State{
-		Version:     stateVersion,
-		ServerURL:   normalizedServer,
-		UserID:      me.ID,
-		Cursor:      cursor,
-		Folders:     targetFolders,
-		Files:       targetFiles,
-		PendingPush: state.PendingPush,
+		Version:       stateVersion,
+		ServerURL:     normalizedServer,
+		UserID:        me.ID,
+		Cursor:        cursor,
+		Folders:       targetFolders,
+		Files:         targetFiles,
+		PendingPushes: nextPending,
 	}
 	if err := saveStateAtomically(root, nextState); err != nil {
 		return Result{}, err

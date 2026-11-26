@@ -540,6 +540,7 @@ type failingMetaStore struct {
 	files.ShareStore
 	files.SyncStore
 	files.ContentUpdateStore
+	files.UploadSessionStore
 }
 
 func (failingMetaStore) Create(context.Context, files.StoredFile) error {

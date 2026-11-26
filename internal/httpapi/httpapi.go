@@ -100,6 +100,11 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("GET /api/v1/shares/{share_id}/files/{file_id}/content", h.downloadSharedFile)
 
 	mux.HandleFunc("GET /api/v1/sync/changes", h.listSyncChanges)
+
+	mux.HandleFunc("POST /api/v1/uploads", h.createUploadSession)
+	mux.HandleFunc("GET /api/v1/uploads/{id}", h.getUploadSession)
+	mux.HandleFunc("PUT /api/v1/uploads/{id}/chunks/{index}", h.uploadChunk)
+	mux.HandleFunc("POST /api/v1/uploads/{id}/complete", h.completeUploadSession)
 	return mux
 }
 

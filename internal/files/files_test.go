@@ -12,6 +12,7 @@ import (
 )
 
 type stubBlobStore struct {
+	ChunkStore
 	saveFn   func(ctx context.Context, r io.Reader, maxBytes int64) (StagedBlob, error)
 	openFn   func(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	deleteFn func(ctx context.Context, objectKey string) error
@@ -59,6 +60,7 @@ type stubMetadataStore struct {
 	ShareStore
 	SyncStore
 	ContentUpdateStore
+	UploadSessionStore
 	records  []StoredFile
 	createFn func(ctx context.Context, file StoredFile) error
 	listFn   func(ctx context.Context, ownerID string, page ListPage) ([]File, error)
