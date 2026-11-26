@@ -368,3 +368,93 @@ func TestUploadSessionWholeFileBadHashDeletedParentAndExpirationCleanup(t *testi
 		t.Fatalf("expired chunks not cleaned up: %v", err)
 	}
 }
+
+type cancelDuplicateChunkMeta struct {
+	files.MetadataStore
+	cancelNextChunk0 bool
+}
+
+func (m *cancelDuplicateChunkMeta) RecordUploadChunk(ctx context.Context, ownerID string, chunk files.UploadChunk, now time.Time) (bool, error) {
+	if m.cancelNextChunk0 && chunk.Index == 0 {
+		m.cancelNextChunk0 = false
+		return false, context.Canceled
+	}
+	return m.MetadataStore.RecordUploadChunk(ctx, ownerID, chunk, now)
+}
+
+func TestUploadChunkDuplicateCanceledPreservesConfirmedChunk(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx := context.Background()
+	blobs, err := localdisk.NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := sqlite.NewStore(ctx, dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = meta.Close() })
+
+	var seq int
+	nextID := func() (string, error) {
+		seq++
+		return fmt.Sprintf("fault-%d", seq), nil
+	}
+	acctSvc, err := accounts.NewService(meta, accounts.WithIDGenerator(nextID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice, err := acctSvc.Register(ctx, "alice", "password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrappedMeta := &cancelDuplicateChunkMeta{MetadataStore: meta}
+	fileSvc, err := files.NewService(blobs, wrappedMeta, nextID, files.WithUploadChunkSize(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("0123456789abcdefghij") // 20 bytes -> 2 chunks of 10
+	sess, err := fileSvc.CreateUploadSession(ctx, alice.ID, files.CreateUploadRequest{
+		Name:   "resilient.bin",
+		Size:   int64(len(payload)),
+		SHA256: shaHex(payload),
+	})
+	if err != nil {
+		t.Fatalf("CreateUploadSession: %v", err)
+	}
+
+	// 1. First upload of chunk 0 succeeds and is confirmed in SQLite + localdisk.
+	if _, err := fileSvc.UploadChunk(ctx, alice.ID, sess.ID, 0, shaHex(payload[:10]), bytes.NewReader(payload[:10])); err != nil {
+		t.Fatalf("first UploadChunk(0): %v", err)
+	}
+
+	// 2. Duplicate upload of chunk 0 with IDENTICAL content is canceled AFTER SaveChunk writes to disk,
+	// BEFORE RecordUploadChunk commits in SQLite.
+	wrappedMeta.cancelNextChunk0 = true
+	if _, err := fileSvc.UploadChunk(ctx, alice.ID, sess.ID, 0, shaHex(payload[:10]), bytes.NewReader(payload[:10])); err != context.Canceled {
+		t.Fatalf("canceled duplicate UploadChunk(0) = %v, want context.Canceled", err)
+	}
+
+	// 3. Original confirmed chunk 0 must STILL be readable on disk and only 1 chunk file should remain.
+	entries, err := os.ReadDir(filepath.Join(dataDir, "uploads", sess.ID))
+	if err != nil {
+		t.Fatalf("ReadDir uploads/%s: %v", sess.ID, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("staged files in uploads/%s = %d, want 1 (confirmed chunk only)", sess.ID, len(entries))
+	}
+
+	// 4. Upload chunk 1 and complete -> full file assembles and matches SHA-256!
+	if _, err := fileSvc.UploadChunk(ctx, alice.ID, sess.ID, 1, shaHex(payload[10:]), bytes.NewReader(payload[10:])); err != nil {
+		t.Fatalf("UploadChunk(1): %v", err)
+	}
+	published, err := fileSvc.CompleteUploadSession(ctx, alice.ID, sess.ID)
+	if err != nil {
+		t.Fatalf("CompleteUploadSession after canceled duplicate: %v", err)
+	}
+	if published.SHA256 != shaHex(payload) || published.Size != int64(len(payload)) {
+		t.Fatalf("published = %+v, want sha=%s size=%d", published, shaHex(payload), len(payload))
+	}
+}

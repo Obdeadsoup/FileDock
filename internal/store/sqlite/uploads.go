@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS upload_chunks (
 	chunk_index INTEGER NOT NULL,
 	size INTEGER NOT NULL,
 	sha256 TEXT NOT NULL,
+	storage_key TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL,
 	PRIMARY KEY (session_id, chunk_index),
 	FOREIGN KEY (session_id) REFERENCES upload_sessions(id) ON DELETE CASCADE
@@ -51,6 +52,15 @@ CREATE TABLE IF NOT EXISTS upload_chunks (
 func migrateUploadSessions(ctx context.Context, tx *sql.Tx) error {
 	if _, err := tx.ExecContext(ctx, uploadSessionsSchemaDDL); err != nil {
 		return fmt.Errorf("initialize upload_sessions schema: %w", err)
+	}
+	hasStorageKey, err := tableHasColumn(ctx, tx, "upload_chunks", "storage_key")
+	if err != nil {
+		return err
+	}
+	if !hasStorageKey {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE upload_chunks ADD COLUMN storage_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add storage_key column to upload_chunks: %w", err)
+		}
 	}
 	return nil
 }
@@ -140,7 +150,7 @@ func (s *Store) GetUploadSession(ctx context.Context, ownerID, sessionID string)
 
 	rows, err := tx.QueryContext(
 		ctx,
-		`SELECT chunk_index, size, sha256, created_at
+		`SELECT chunk_index, size, sha256, storage_key, created_at
 		 FROM upload_chunks
 		 WHERE session_id = ?
 		 ORDER BY chunk_index ASC`,
@@ -158,7 +168,7 @@ func (s *Store) GetUploadSession(ctx context.Context, ownerID, sessionID string)
 			createdStr string
 		)
 		c.SessionID = sessionID
-		if err := rows.Scan(&c.Index, &c.Size, &c.SHA256, &createdStr); err != nil {
+		if err := rows.Scan(&c.Index, &c.Size, &c.SHA256, &c.StorageKey, &createdStr); err != nil {
 			return files.UploadSession{}, nil, fmt.Errorf("scan upload chunk: %w", err)
 		}
 		parsedAt, err := time.Parse(time.RFC3339Nano, createdStr)
@@ -217,12 +227,13 @@ func (s *Store) RecordUploadChunk(ctx context.Context, ownerID string, chunk fil
 
 	if _, err := tx.ExecContext(
 		ctx,
-		`INSERT INTO upload_chunks (session_id, chunk_index, size, sha256, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO upload_chunks (session_id, chunk_index, size, sha256, storage_key, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
 		chunk.SessionID,
 		chunk.Index,
 		chunk.Size,
 		chunk.SHA256,
+		chunk.StorageKey,
 		chunk.CreatedAt.UTC().Format(time.RFC3339Nano),
 	); err != nil {
 		return false, fmt.Errorf("insert upload chunk: %w", err)
@@ -307,6 +318,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		CreatedAt:       createdUTC,
 	}
 	if err := appendFileUpsert(ctx, tx, ownerID, published, createdUTC); err != nil {
+		return files.File{}, false, err
+	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFileUpload, files.ResourceTypeFile, file.ID, createdUTC); err != nil {
 		return files.File{}, false, err
 	}
 

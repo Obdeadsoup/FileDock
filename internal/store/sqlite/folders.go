@@ -101,6 +101,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`, folder.ID, ownerID, folder.ParentID, folder.Name,
 	if err := appendFolderUpsert(ctx, tx, ownerID, folder, folder.CreatedAt); err != nil {
 		return err
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFolderCreate, files.ResourceTypeFolder, folder.ID, folder.CreatedAt.UTC()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -187,6 +190,9 @@ WHERE owner_id = ? AND id = ? RETURNING `+folderColumns,
 	if err := appendFolderUpsert(ctx, tx, ownerID, folder, now); err != nil {
 		return files.Folder{}, err
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFolderUpdate, files.ResourceTypeFolder, folder.ID, now.UTC()); err != nil {
+		return files.Folder{}, err
+	}
 	return folder, tx.Commit()
 }
 
@@ -221,6 +227,9 @@ OR EXISTS(SELECT 1 FROM files WHERE owner_id = ? AND parent_id = ?)`, ownerID, i
 		return err
 	}
 	if err := appendFolderDelete(ctx, tx, ownerID, id, now); err != nil {
+		return err
+	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFolderDelete, files.ResourceTypeFolder, id, now.UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()

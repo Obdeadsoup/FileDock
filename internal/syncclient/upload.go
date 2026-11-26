@@ -25,6 +25,7 @@ type UploadConfig struct {
 	FilePath       string
 	ParentID       *string
 	SessionID      string
+	CACertFile     string
 	HTTPClient     *http.Client
 	API            API
 	OnSessionReady func(session UploadSessionInfo)
@@ -54,7 +55,14 @@ func Upload(ctx context.Context, cfg UploadConfig) (UploadResult, error) {
 
 	api := cfg.API
 	if api == nil {
-		api, err = NewHTTPAPI(normalizedServer, cfg.Token, cfg.HTTPClient)
+		httpClient := cfg.HTTPClient
+		if httpClient == nil && strings.TrimSpace(cfg.CACertFile) != "" {
+			httpClient, err = NewHTTPClient(cfg.CACertFile)
+			if err != nil {
+				return UploadResult{}, err
+			}
+		}
+		api, err = NewHTTPAPI(normalizedServer, cfg.Token, httpClient)
 		if err != nil {
 			return UploadResult{}, err
 		}

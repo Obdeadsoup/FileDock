@@ -119,6 +119,9 @@ VALUES (?, ?, ?, 0, 0, '')`,
 	if err := appendFileUpsert(ctx, tx, ownerID, updated, nowUTC); err != nil {
 		return files.File{}, err
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFileContentUpdate, files.ResourceTypeFile, id, nowUTC); err != nil {
+		return files.File{}, err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return files.File{}, fmt.Errorf("commit file content update: %w", err)

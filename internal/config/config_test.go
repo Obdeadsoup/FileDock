@@ -45,6 +45,41 @@ func TestLoadRejectsInvalidDataDir(t *testing.T) {
 	}
 }
 
+func TestLoadRequiresTLSForNonLoopback(t *testing.T) {
+	unsetEnvForTest(t, "FILEDOCK_TLS_CERT_FILE")
+	unsetEnvForTest(t, "FILEDOCK_TLS_KEY_FILE")
+
+	for _, addr := range []string{"0.0.0.0:8443", ":8443", "[::]:8443", "192.168.1.10:8443"} {
+		t.Setenv("FILEDOCK_ADDR", addr)
+		if _, err := Load(); err == nil {
+			t.Fatalf("Load() for non-loopback %q without TLS: expected error, got nil", addr)
+		}
+	}
+
+	// Partial TLS config (cert without key) is rejected even on loopback.
+	t.Setenv("FILEDOCK_ADDR", "127.0.0.1:8443")
+	t.Setenv("FILEDOCK_TLS_CERT_FILE", "/tmp/cert.pem")
+	unsetEnvForTest(t, "FILEDOCK_TLS_KEY_FILE")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() expected error when only FILEDOCK_TLS_CERT_FILE is set")
+	}
+
+	// Non-loopback with both cert and key paths passes config.Load, and LoadTLSConfig fails cleanly on missing files.
+	t.Setenv("FILEDOCK_ADDR", "0.0.0.0:8443")
+	t.Setenv("FILEDOCK_TLS_CERT_FILE", "/tmp/does-not-exist-cert.pem")
+	t.Setenv("FILEDOCK_TLS_KEY_FILE", "/tmp/does-not-exist-key.pem")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with TLS paths error = %v", err)
+	}
+	if !cfg.TLSEnabled() {
+		t.Fatal("expected TLSEnabled() == true")
+	}
+	if _, err := cfg.LoadTLSConfig(); err == nil {
+		t.Fatal("LoadTLSConfig() expected error for missing cert/key files")
+	}
+}
+
 func unsetEnvForTest(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")

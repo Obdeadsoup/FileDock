@@ -44,11 +44,19 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 }
 
+func resolveCACert(flagVal string) string {
+	if trimmed := strings.TrimSpace(flagVal); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(os.Getenv("FILEDOCK_CA_CERT"))
+}
+
 func runSyncPull(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("sync pull", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	serverURL := fs.String("server", "", "FileDock server base URL")
 	dir := fs.String("dir", "", "local mirror directory")
+	caCert := fs.String("ca-cert", "", "optional PEM CA certificate file for HTTPS verification")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -62,9 +70,10 @@ func runSyncPull(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	res, err := syncclient.Pull(ctx, syncclient.Config{
-		ServerURL: *serverURL,
-		Token:     token,
-		Dir:       *dir,
+		ServerURL:  *serverURL,
+		Token:      token,
+		Dir:        *dir,
+		CACertFile: resolveCACert(*caCert),
 	})
 	if err != nil {
 		return err
@@ -90,6 +99,7 @@ func runSyncPush(ctx context.Context, args []string, stdout io.Writer) error {
 	serverURL := fs.String("server", "", "FileDock server base URL")
 	dir := fs.String("dir", "", "local mirror directory")
 	relPath := fs.String("path", "", "relative path of tracked file inside mirror directory")
+	caCert := fs.String("ca-cert", "", "optional PEM CA certificate file for HTTPS verification")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -103,10 +113,11 @@ func runSyncPush(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	res, err := syncclient.Push(ctx, syncclient.PushConfig{
-		ServerURL: *serverURL,
-		Token:     token,
-		Dir:       *dir,
-		RelPath:   *relPath,
+		ServerURL:  *serverURL,
+		Token:      token,
+		Dir:        *dir,
+		RelPath:    *relPath,
+		CACertFile: resolveCACert(*caCert),
 	})
 	if err != nil {
 		return err
@@ -139,6 +150,7 @@ func runUpload(ctx context.Context, args []string, stdout io.Writer) error {
 	filePath := fs.String("file", "", "local file to upload")
 	parentID := fs.String("parent-id", "", "optional target folder ID on server")
 	sessionID := fs.String("session", "", "optional upload session ID to resume")
+	caCert := fs.String("ca-cert", "", "optional PEM CA certificate file for HTTPS verification")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
@@ -157,11 +169,12 @@ func runUpload(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 
 	res, err := syncclient.Upload(ctx, syncclient.UploadConfig{
-		ServerURL: *serverURL,
-		Token:     token,
-		FilePath:  *filePath,
-		ParentID:  parentPtr,
-		SessionID: *sessionID,
+		ServerURL:  *serverURL,
+		Token:      token,
+		FilePath:   *filePath,
+		ParentID:   parentPtr,
+		SessionID:  *sessionID,
+		CACertFile: resolveCACert(*caCert),
 		OnSessionReady: func(session syncclient.UploadSessionInfo) {
 			_, _ = fmt.Fprintf(
 				stdout,

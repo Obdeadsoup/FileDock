@@ -75,6 +75,9 @@ VALUES (?, ?, ?, 0, 0, '')`,
 	if err := appendFileDelete(ctx, tx, ownerID, id, nowUTC); err != nil {
 		return err
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFileDelete, files.ResourceTypeFile, id, nowUTC); err != nil {
+		return err
+	}
 
 	return tx.Commit()
 }

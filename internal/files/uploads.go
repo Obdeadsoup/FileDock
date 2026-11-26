@@ -50,13 +50,14 @@ type CreateUploadRequest struct {
 	SHA256   string
 }
 
-// UploadChunk describes a confirmed chunk stored for an upload session.
+// UploadChunk describes a confirmed or newly staged chunk for an upload session.
 type UploadChunk struct {
-	SessionID string
-	Index     int
-	Size      int64
-	SHA256    string
-	CreatedAt time.Time
+	SessionID  string
+	Index      int
+	Size       int64
+	SHA256     string
+	StorageKey string
+	CreatedAt  time.Time
 }
 
 // UploadSession describes a persisted resumable upload session and its progress.
@@ -81,8 +82,8 @@ type UploadSession struct {
 // ChunkStore manages staged upload chunk bytes outside the main object store.
 type ChunkStore interface {
 	SaveChunk(ctx context.Context, sessionID string, index int, r io.Reader, expectedSize int64, expectedSHA256 string) (UploadChunk, error)
-	OpenChunk(ctx context.Context, sessionID string, index int, sha256 string) (io.ReadCloser, error)
-	DeleteChunk(ctx context.Context, sessionID string, index int, sha256 string) error
+	OpenChunk(ctx context.Context, sessionID string, chunk UploadChunk) (io.ReadCloser, error)
+	DeleteStagedChunk(ctx context.Context, sessionID, storageKey string) error
 	DeleteSessionChunks(ctx context.Context, sessionID string) error
 }
 
@@ -257,12 +258,14 @@ func (s *Service) UploadChunk(ctx context.Context, ownerID, sessionID string, in
 
 	alreadyConfirmed, err := s.meta.RecordUploadChunk(ctx, ownerID, staged, staged.CreatedAt)
 	if err != nil {
-		// Remove the staged chunk file when recording fails (including ErrChunkConflict where
-		// the conflicting chunk has a different sha256 filename than the existing confirmed chunk).
-		_ = s.blobs.DeleteChunk(context.WithoutCancel(ctx), sessionID, index, staged.SHA256)
+		// Only delete this request's unreferenced staged file; never touch any previously confirmed chunk.
+		_ = s.blobs.DeleteStagedChunk(context.WithoutCancel(ctx), sessionID, staged.StorageKey)
 		return UploadChunk{}, err
 	}
-	_ = alreadyConfirmed
+	if alreadyConfirmed {
+		// Same chunk content was already confirmed under an earlier StorageKey; remove this duplicate copy.
+		_ = s.blobs.DeleteStagedChunk(context.WithoutCancel(ctx), sessionID, staged.StorageKey)
+	}
 	return staged, nil
 }
 
@@ -488,7 +491,7 @@ func (r *chunkSequenceReader) Read(p []byte) (int, error) {
 				return 0, io.EOF
 			}
 			c := r.chunks[r.pos]
-			rc, err := r.blobs.OpenChunk(r.ctx, r.sessionID, c.Index, c.SHA256)
+			rc, err := r.blobs.OpenChunk(r.ctx, r.sessionID, c)
 			if err != nil {
 				return 0, fmt.Errorf("open chunk %d: %w", c.Index, err)
 			}

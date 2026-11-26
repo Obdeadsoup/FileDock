@@ -37,11 +37,76 @@ func run(args []string, stdout io.Writer, logger *slog.Logger) error {
 		switch args[0] {
 		case "claim-legacy":
 			return runClaimLegacy(args[1:], stdout, logger)
+		case "audit":
+			return runAudit(args[1:], stdout, logger)
 		default:
 			return fmt.Errorf("unknown command %q", args[0])
 		}
 	}
 	return runServer(logger)
+}
+
+func runAudit(args []string, stdout io.Writer, logger *slog.Logger) error {
+	if len(args) == 0 || args[0] != "list" {
+		return errors.New("usage: filedockd audit list [--user <username-or-id>] [--action <action>] [--limit <n>]")
+	}
+	fs := flag.NewFlagSet("audit list", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	userFilter := fs.String("user", "", "filter by actor username or user ID")
+	actionFilter := fs.String("action", "", "filter by audit action")
+	limit := fs.Int("limit", files.DefaultAuditListLimit, "maximum number of audit records to return")
+	if err := fs.Parse(args[1:]); err != nil {
+		return fmt.Errorf("parse audit list flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments for audit list: %v", fs.Args())
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	metaStore, err := sqlite.NewStore(ctx, cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("init sqlite store: %w", err)
+	}
+	defer func() {
+		if closeErr := metaStore.Close(); closeErr != nil {
+			logger.Error("close sqlite store failed", "error", closeErr)
+		}
+	}()
+
+	actorID := strings.TrimSpace(*userFilter)
+	if actorID != "" {
+		if u, err := metaStore.GetUserByUsername(ctx, actorID); err == nil {
+			actorID = u.ID
+		}
+	}
+
+	entries, err := metaStore.ListAuditLogs(ctx, files.AuditFilter{
+		ActorUserID: actorID,
+		Action:      *actionFilter,
+		Limit:       *limit,
+	})
+	if err != nil {
+		return fmt.Errorf("list audit logs: %w", err)
+	}
+	for _, entry := range entries {
+		_, _ = fmt.Fprintf(
+			stdout,
+			"%s actor=%s action=%s resource=%s:%s\n",
+			entry.OccurredAt.UTC().Format(time.RFC3339Nano),
+			entry.ActorUserID,
+			entry.Action,
+			entry.ResourceType,
+			entry.ResourceID,
+		)
+	}
+	return nil
 }
 
 func runClaimLegacy(args []string, stdout io.Writer, logger *slog.Logger) error {
@@ -92,6 +157,10 @@ func runServer(logger *slog.Logger) error {
 	defer stop()
 
 	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	tlsCfg, err := cfg.LoadTLSConfig()
 	if err != nil {
 		return err
 	}
@@ -147,14 +216,20 @@ func runServer(logger *slog.Logger) error {
 	}
 	server := &http.Server{
 		Handler:           httpapi.NewHandler(fileService, accountService),
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
-	logger.Info("HTTP server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir)
+	if tlsCfg != nil {
+		go func() { serveErr <- server.ServeTLS(listener, "", "") }()
+		logger.Info("HTTPS server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir)
+	} else {
+		go func() { serveErr <- server.Serve(listener) }()
+		logger.Info("HTTP server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir)
+	}
 
 	select {
 	case err = <-serveErr:

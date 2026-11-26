@@ -9,12 +9,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"example.com/filedock/internal/files"
 )
 
-// SaveChunk streams a single upload chunk into the session's staging directory, enforcing
-// exact expectedSize and optional expectedSHA256 before committing it under <index>-<sha256>.chunk.
+// SaveChunk streams a single upload chunk into a unique per-request file inside the session's
+// staging directory, enforcing exact expectedSize and optional expectedSHA256.
+// Because each request gets its own unique StorageKey, cleaning up a failed or duplicate request
+// can never delete a previously confirmed chunk.
 func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io.Reader, expectedSize int64, expectedSHA256 string) (files.UploadChunk, error) {
 	if err := ctx.Err(); err != nil {
 		return files.UploadChunk{}, err
@@ -78,46 +81,63 @@ func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io
 	}
 	closed = true
 
-	finalPath := s.chunkPath(sessionID, index, actualSHA)
+	nonce, err := generateObjectKey()
+	if err != nil {
+		return files.UploadChunk{}, fmt.Errorf("generate chunk storage key: %w", err)
+	}
+	storageKey := fmt.Sprintf("%d-%s.chunk", index, nonce)
+	finalPath := filepath.Join(sessionDir, storageKey)
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return files.UploadChunk{}, fmt.Errorf("commit chunk file: %w", err)
 	}
 	committed = true
 
 	return files.UploadChunk{
-		SessionID: sessionID,
-		Index:     index,
-		Size:      written,
-		SHA256:    actualSHA,
+		SessionID:  sessionID,
+		Index:      index,
+		Size:       written,
+		SHA256:     actualSHA,
+		StorageKey: storageKey,
 	}, nil
 }
 
-// OpenChunk opens a previously staged chunk file by session ID, chunk index, and SHA-256.
-func (s *Store) OpenChunk(ctx context.Context, sessionID string, index int, sha256Hex string) (io.ReadCloser, error) {
+// OpenChunk opens a previously confirmed chunk file using its recorded StorageKey
+// (falling back to legacy <index>-<sha256>.chunk if StorageKey is empty).
+func (s *Store) OpenChunk(ctx context.Context, sessionID string, chunk files.UploadChunk) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := files.ValidateID(sessionID); err != nil || index < 0 || !isValidSHA256(sha256Hex) {
+	if err := files.ValidateID(sessionID); err != nil || chunk.Index < 0 {
 		return nil, files.ErrUploadSessionNotFound
 	}
-	f, err := os.Open(s.chunkPath(sessionID, index, sha256Hex))
+	key := chunk.StorageKey
+	if key == "" {
+		if !isValidSHA256(chunk.SHA256) {
+			return nil, files.ErrUploadSessionNotFound
+		}
+		key = fmt.Sprintf("%d-%s.chunk", chunk.Index, chunk.SHA256)
+	}
+	if !isSafeChunkStorageKey(key) {
+		return nil, files.ErrUploadSessionNotFound
+	}
+	f, err := os.Open(filepath.Join(s.uploadsDir, sessionID, key))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("%w: chunk %d missing on disk", files.ErrIncompleteUpload, index)
+			return nil, fmt.Errorf("%w: chunk %d missing on disk", files.ErrIncompleteUpload, chunk.Index)
 		}
-		return nil, fmt.Errorf("open chunk %d: %w", index, err)
+		return nil, fmt.Errorf("open chunk %d: %w", chunk.Index, err)
 	}
 	return f, nil
 }
 
-// DeleteChunk removes a single staged chunk file if present.
-func (s *Store) DeleteChunk(_ context.Context, sessionID string, index int, sha256Hex string) error {
-	if err := files.ValidateID(sessionID); err != nil || index < 0 || !isValidSHA256(sha256Hex) {
+// DeleteStagedChunk removes a single unreferenced per-request staged chunk file if present.
+func (s *Store) DeleteStagedChunk(_ context.Context, sessionID, storageKey string) error {
+	if err := files.ValidateID(sessionID); err != nil || !isSafeChunkStorageKey(storageKey) {
 		return nil
 	}
-	err := os.Remove(s.chunkPath(sessionID, index, sha256Hex))
+	err := os.Remove(filepath.Join(s.uploadsDir, sessionID, storageKey))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("delete chunk %d: %w", index, err)
+		return fmt.Errorf("delete staged chunk %q: %w", storageKey, err)
 	}
 	return nil
 }
@@ -133,8 +153,11 @@ func (s *Store) DeleteSessionChunks(_ context.Context, sessionID string) error {
 	return nil
 }
 
-func (s *Store) chunkPath(sessionID string, index int, sha256Hex string) string {
-	return filepath.Join(s.uploadsDir, sessionID, fmt.Sprintf("%d-%s.chunk", index, sha256Hex))
+func isSafeChunkStorageKey(key string) bool {
+	if key == "" || key == "." || key == ".." || strings.ContainsAny(key, `/\`) || strings.Contains(key, "..") {
+		return false
+	}
+	return strings.HasSuffix(key, ".chunk")
 }
 
 func isValidSHA256(s string) bool {

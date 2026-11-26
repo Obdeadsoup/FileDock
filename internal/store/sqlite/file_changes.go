@@ -33,5 +33,8 @@ func (s *Store) UpdateFile(ctx context.Context, ownerID, id string, changes file
 	if err := appendFileUpsert(ctx, tx, ownerID, record.File, now); err != nil {
 		return files.File{}, err
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionFileUpdate, files.ResourceTypeFile, id, now.UTC()); err != nil {
+		return files.File{}, err
+	}
 	return record.File, tx.Commit()
 }

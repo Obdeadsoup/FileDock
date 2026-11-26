@@ -15,10 +15,26 @@ go run ./cmd/filedockd
 
 常用环境变量：
 
-- `FILEDOCK_ADDR`：监听地址，默认 `127.0.0.1:8080`（格式为 `主机:端口`，如 `127.0.0.1:9090` 或 `[::1]:9090`，端口 `0` 由系统分配）。
-- `FILEDOCK_DATA_DIR`：本地数据目录，默认 `./data`（用于保存 `objects/`、`tmp/` 和 `filedock.db`，已通过 `.gitignore` 忽略，不提交到 Git）。
+- `FILEDOCK_ADDR`：监听地址，默认 `127.0.0.1:8080`（格式为 `主机:端口`，如 `127.0.0.1:9090` 或 `[::1]:9090`，端口 `0` 由系统分配）。监听非回环地址（如 `0.0.0.0:8443`）时**必须**配置 TLS，否则启动直接报错。
+- `FILEDOCK_DATA_DIR`：本地数据目录，默认 `./data`（用于保存 `objects/`、`tmp/`、`uploads/` 和 `filedock.db`，已通过 `.gitignore` 忽略，不提交到 Git）。
+- `FILEDOCK_TLS_CERT_FILE` / `FILEDOCK_TLS_KEY_FILE`：可选的 TLS 证书与私钥 PEM 文件路径；两者同时配置时启用 HTTPS（TLS 1.2+），仅配置其一或文件无效时启动报错。
 
 使用 `Ctrl+C` 停止服务，服务最多等待 5 秒完成正在处理的请求。
+
+### HTTPS 与本地测试 CA
+
+服务端启用 TLS 示例：
+
+```sh
+FILEDOCK_ADDR="127.0.0.1:8443" \
+FILEDOCK_TLS_CERT_FILE=./certs/server.pem \
+FILEDOCK_TLS_KEY_FILE=./certs/server.key \
+go run ./cmd/filedockd
+```
+
+命令行客户端 `filedock upload`、`filedock sync pull`、`filedock sync push` 共用 HTTPS 客户端配置：
+- 默认校验证书链与主机名，可通过 `--ca-cert <path>` 或环境变量 `FILEDOCK_CA_CERT` 加载本地测试 CA。
+- Bearer 认证请求仅允许通过 HTTPS 或回环 HTTP（`localhost` / `127.0.0.0/8` / `::1`）发送；重定向同样受该规则约束，且跨源重定向自动剥离 `Authorization` 头。
 
 在 PowerShell 中覆盖监听地址与数据目录：
 
@@ -341,6 +357,18 @@ FILEDOCK_DATA_DIR=./data go run ./cmd/filedockd claim-legacy --owner alice
 ```
 
 命令会输出本次认领的旧文件数量（例如 `claimed 1 legacy file(s) for owner alice`），文件随后出现在 Alice 的根目录。重复执行时已归属文件不会被再次修改，报告处理数量为 `0`。
+
+## 操作审计与本地查询（`filedockd audit list`）
+
+服务端在 SQLite `audit_logs` 表中记录操作者用户 ID、动作、资源类型与资源 ID 以及时间，覆盖文件上传完成（`file.upload`）、内容更新（`file.content_update`）、改名/移动（`file.update`）、删除（`file.delete`），目录创建/修改/删除（`folder.create`、`folder.update`、`folder.delete`），以及共享创建/撤销（`share.create`、`share.delete`）。
+
+- 审计写入与业务变更在**同一个 SQLite 写事务**内提交；事务回滚时无成功记录，幂等重试完成上传或重复创建同一共享仅记录首次实际变更。审计表不记录密码、令牌、正文或磁盘对象路径。
+- 通过本地命令查询审计记录（`--user` 支持用户名或用户 ID，默认 `--limit 50`，最大 `500`）：
+
+```sh
+FILEDOCK_DATA_DIR=./data go run ./cmd/filedockd audit list --user alice --limit 20
+FILEDOCK_DATA_DIR=./data go run ./cmd/filedockd audit list --action file.upload --limit 10
+```
 
 ## 测试与构建
 

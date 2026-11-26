@@ -4,15 +4,15 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 
 | 包 | 职责 | 可依赖的模块内包 |
 | --- | --- | --- |
-| `cmd/filedockd` | 组装依赖，启动 HTTP 服务，执行本地维护子命令（如 `claim-legacy`），管理进程日志和关闭流程 | `internal/config`、`internal/httpapi`、已登记的业务包和存储适配器 |
-| `cmd/filedock` | 命令行客户端入口（`filedock sync pull` / `filedock sync push` / `filedock upload`），读取 `FILEDOCK_TOKEN` 并调用客户端包 | `internal/syncclient` |
-| `internal/config` | 读取和校验进程配置 | 无 |
+| `cmd/filedockd` | 组装依赖，启动 HTTP/HTTPS 服务，执行本地维护子命令（如 `claim-legacy`、`audit list`），管理进程日志和关闭流程 | `internal/config`、`internal/httpapi`、已登记的业务包和存储适配器 |
+| `cmd/filedock` | 命令行客户端入口（`filedock sync pull` / `filedock sync push` / `filedock upload`），读取 `FILEDOCK_TOKEN` 与可选 `--ca-cert`/`FILEDOCK_CA_CERT` 并调用客户端包 | `internal/syncclient` |
+| `internal/config` | 读取和校验进程配置（含监听地址回环约束与 TLS 证书/私钥配置） | 无 |
 | `internal/httpapi` | 注册路由、解析 HTTP 请求与会话令牌、调用业务服务、转换 HTTP 响应 | 已登记的业务包（`internal/accounts`、`internal/files`） |
 | `internal/accounts` | 账户注册、Argon2id 密码校验、Bearer 会话令牌签发、认证与撤销 | 无 |
-| `internal/files` | 校验文件和目录名称、标识、搜索条件、共享参数、同步游标、上传会话与分块参数和分页，协调目录管理、文件移动、删除与后台清理、搜索、只读共享、增量同步、分块上传与断点续传、内容写入与下载 | 无 |
-| `internal/store/sqlite` | 持久化账户、会话摘要、文件、目录元数据、共享授权、按所有者隔离的增量变更日志、分块上传会话与已确认分块及磁盘清理任务，执行事务化迁移、树约束检查、搜索查询与旧文件认领 | `internal/accounts`、`internal/files` |
-| `internal/store/localdisk` | 本地磁盘暂存、独立分块上传暂存区（`uploads/`）、流式写入、计算 SHA-256 与打开内容流 | `internal/files` |
-| `internal/syncclient` | 客户端拉取同步、单文件显式内容推送与分块断点续传上传：通过 HTTP API 认证用户、拉取变更、以不透明 `ETag` 条件推送内容（按文件 ID 跟踪待确认推送）或按分块续传新文件，在 `os.Root` 与目录锁限制内安全应用与原子提交清单 | 无 |
+| `internal/files` | 校验文件和目录名称、标识、搜索条件、共享参数、同步游标、上传会话与分块参数、审计过滤和分页，协调目录管理、文件移动、删除与后台清理、搜索、只读共享、增量同步、分块上传与断点续传、内容写入与下载 | 无 |
+| `internal/store/sqlite` | 持久化账户、会话摘要、文件、目录元数据、共享授权、按所有者隔离的增量变更日志、分块上传会话与已确认分块（含独立 `storage_key`）、操作审计日志及磁盘清理任务，执行事务化迁移、树约束检查、搜索查询与旧文件认领 | `internal/accounts`、`internal/files` |
+| `internal/store/localdisk` | 本地磁盘暂存、独立分块上传暂存区（`uploads/`，每次请求写入独立随机键避免误删已确认分块）、流式写入、计算 SHA-256 与打开内容流 | `internal/files` |
+| `internal/syncclient` | 客户端拉取同步、单文件显式内容推送与分块断点续传上传：共用 HTTPS/CA 校验与防跨源重定向泄漏令牌的 HTTP 客户端，按文件 ID 跟踪待确认推送，在 `os.Root` 与目录锁限制内安全应用与原子提交清单 | 无 |
 | `internal/archcheck` | 在 `go test ./...` 中检查生产代码的直接导入 | 规则实现位于测试文件 |
 
 命令入口与架构测试包禁止被生产代码导入。HTTP 层禁止直接访问存储适配器、SQL、磁盘文件和进程配置。下载文件时，HTTP 层先认证会话并将用户 ID 传给 `internal/files`，从业务服务取得读取流后再写入响应。
@@ -42,7 +42,8 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | 内容更新 | 认证会话，校验 `If-Match` 强 `ETag`（缺省 `428`、过期 `412`）并流式接收新正文 | `files` 预查权限与版本，写新对象后原子提交并回滚清理失败的新对象 | `localdisk` 在事务外写入新对象，`sqlite` 在写事务内复核版本、递增 `content_revision`、登记旧对象 `blob_cleanups` 并追加 `file.upsert` |
 | 共享与共享访问 | 认证会话，解析共享创建/列表/撤销及以 `share_id` 为范围的浏览和下载请求 | `files` 校验资源类型、接收者、方向与分页，先校验授权再打开磁盘流 | `sqlite` 在同一事务中校验所有者/接收者、目标资源和递归子树关系并隐藏外部父目录；`localdisk` 打开内容流 |
 | 增量同步 | 认证会话，解析 `after` 游标与 `limit`，返回 `items`、`next_cursor`、`has_more` | `files` 校验所有者、游标非负与分页上限 | `sqlite` 维护每用户独立递增 `seq`，在元数据写入同一事务中落库变更事件，用 `limit+1` 只读分页查询 |
-| 分块上传与断点续传 | 认证会话，解析上传会话创建/进度查询/分块流式写入/完成请求，映射状态码 | `files` 校验目标目录、文件名、总大小、SHA-256、暂存配额与分块范围，串行化同一会话的完成操作并在事务外流式组装校验，后台清理过期会话 | `localdisk` 在独立 `uploads/<session_id>/` 目录按 `<index>-<sha256>.chunk` 暂存分块并组装入 `objects/`；`sqlite` 持久化 `upload_sessions`/`upload_chunks`，完成时在同一写事务内登记文件、追加 `file.upsert` 并保留完成结果 |
+| 分块上传与断点续传 | 认证会话，解析上传会话创建/进度查询/分块流式写入/完成请求，映射状态码 | `files` 校验目标目录、文件名、总大小、SHA-256、暂存配额与分块范围，串行化同一会话的完成操作并在事务外流式组装校验，后台清理过期会话 | `localdisk` 在独立 `uploads/<session_id>/` 目录按独立随机 `<index>-<nonce>.chunk` 暂存分块（失败仅删本次未引用文件，绝不误删已确认分块）并组装入 `objects/`；`sqlite` 持久化 `upload_sessions`/`upload_chunks`，完成时在同一写事务内登记文件、追加 `file.upsert` 与审计日志并保留完成结果 |
+| 操作审计 | 不暴露未授权查询；写操作经由正常业务接口触发 | `files` 定义审计动作常量与查询过滤/上限规范 | `sqlite` 在 `audit_logs` 表与业务变更同一写事务内原子记录成功操作（幂等重试不重复记账，回滚无记录，不存凭据与对象路径），由 `cmd/filedockd audit list` 本地查询 |
 
 所有操作均由 `cmd/filedockd` 完成服务和适配器的组装。
 

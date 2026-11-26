@@ -29,6 +29,7 @@ type PushConfig struct {
 	Token      string
 	Dir        string
 	RelPath    string
+	CACertFile string
 	HTTPClient *http.Client
 	API        API
 }
@@ -64,7 +65,14 @@ func Push(ctx context.Context, cfg PushConfig) (PushResult, error) {
 
 	api := cfg.API
 	if api == nil {
-		api, err = NewHTTPAPI(normalizedServer, cfg.Token, cfg.HTTPClient)
+		httpClient := cfg.HTTPClient
+		if httpClient == nil && strings.TrimSpace(cfg.CACertFile) != "" {
+			httpClient, err = NewHTTPClient(cfg.CACertFile)
+			if err != nil {
+				return PushResult{}, err
+			}
+		}
+		api, err = NewHTTPAPI(normalizedServer, cfg.Token, httpClient)
 		if err != nil {
 			return PushResult{}, err
 		}

@@ -27,6 +27,7 @@ type Config struct {
 	ServerURL     string
 	Token         string
 	Dir           string
+	CACertFile    string
 	PageLimit     int
 	HTTPClient    *http.Client
 	API           API
@@ -59,7 +60,14 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 
 	api := cfg.API
 	if api == nil {
-		api, err = NewHTTPAPI(normalizedServer, cfg.Token, cfg.HTTPClient)
+		httpClient := cfg.HTTPClient
+		if httpClient == nil && strings.TrimSpace(cfg.CACertFile) != "" {
+			httpClient, err = NewHTTPClient(cfg.CACertFile)
+			if err != nil {
+				return Result{}, err
+			}
+		}
+		api, err = NewHTTPAPI(normalizedServer, cfg.Token, httpClient)
 		if err != nil {
 			return Result{}, err
 		}

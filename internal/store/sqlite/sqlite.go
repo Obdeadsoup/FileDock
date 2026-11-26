@@ -152,6 +152,9 @@ CREATE INDEX IF NOT EXISTS idx_files_owner_created_at_ns_id
 	if err := migrateUploadSessions(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateAuditLogs(ctx, tx); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration transaction: %w", err)
@@ -396,6 +399,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		return fmt.Errorf("insert file metadata: %w", err)
 	}
 	if err := appendFileUpsert(ctx, tx, file.OwnerID, file.File, createdUTC); err != nil {
+		return err
+	}
+	if err := appendAuditLog(ctx, tx, file.OwnerID, files.AuditActionFileUpload, files.ResourceTypeFile, file.ID, createdUTC); err != nil {
 		return err
 	}
 	return tx.Commit()

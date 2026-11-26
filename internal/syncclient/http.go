@@ -3,12 +3,16 @@ package syncclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +31,7 @@ var (
 	ErrPayloadTooLarge      = errors.New("file exceeds server maximum size (HTTP 413)")
 	ErrServerConflict       = errors.New("conflict on server (HTTP 409)")
 	ErrSessionExpired       = errors.New("upload session expired on server (HTTP 410)")
+	ErrInsecureTransport    = errors.New("bearer token requests require HTTPS or loopback HTTP")
 )
 
 // UploadSessionInfo represents upload session progress returned by /api/v1/uploads.
@@ -118,23 +123,124 @@ type HTTPAPI struct {
 	client  *http.Client
 }
 
-// NormalizeServerURL validates and normalizes a FileDock server base URL.
-func NormalizeServerURL(raw string) (string, error) {
+// ValidateBearerURL ensures a target URL is safe for Bearer-authenticated requests:
+// HTTPS is allowed for any host, while plain HTTP is restricted strictly to loopback hosts.
+func ValidateBearerURL(raw string) (*url.URL, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return "", errors.New("server URL is required")
+		return nil, errors.New("server URL is required")
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil {
-		return "", fmt.Errorf("invalid server URL: %w", err)
+		return nil, fmt.Errorf("invalid server URL: %w", err)
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", fmt.Errorf("invalid server URL %q: must use http or https with a host", raw)
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("invalid server URL %q: must use http or https with a host", raw)
+	}
+	if scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return nil, fmt.Errorf("%w: %q", ErrInsecureTransport, raw)
+	}
+	u.Scheme = scheme
+	return u, nil
+}
+
+// NormalizeServerURL validates and normalizes a FileDock server base URL.
+func NormalizeServerURL(raw string) (string, error) {
+	u, err := ValidateBearerURL(raw)
+	if err != nil {
+		return "", err
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil
+}
+
+// NewHTTPClient creates a TLS-verifying HTTP client shared by upload, pull, and push.
+// When caCertFile is non-empty, its PEM certificates are trusted in addition to system roots.
+// Redirects enforce the same HTTPS-or-loopback policy and strip Authorization across origins.
+func NewHTTPClient(caCertFile string) (*http.Client, error) {
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{}
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if trimmed := strings.TrimSpace(caCertFile); trimmed != "" {
+		pemData, err := os.ReadFile(trimmed)
+		if err != nil {
+			return nil, fmt.Errorf("read CA certificate %q: %w", trimmed, err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("CA certificate %q contains no valid PEM certificates", trimmed)
+		}
+		tlsCfg.RootCAs = pool
+	}
+	transport.TLSClientConfig = tlsCfg
+
+	return &http.Client{
+		Timeout:       60 * time.Second,
+		Transport:     transport,
+		CheckRedirect: bearerSafeCheckRedirect(nil),
+	}, nil
+}
+
+func bearerSafeCheckRedirect(next func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if _, err := ValidateBearerURL(req.URL.String()); err != nil {
+			return fmt.Errorf("redirect blocked: %w", err)
+		}
+		if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
+			req.Header.Del("Authorization")
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		return nil
+	}
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	schemeA := strings.ToLower(a.Scheme)
+	schemeB := strings.ToLower(b.Scheme)
+	if schemeA != schemeB {
+		return false
+	}
+	return strings.EqualFold(a.Hostname(), b.Hostname()) && effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func isLoopbackHost(host string) bool {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(trimmed)
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewHTTPAPI constructs an HTTPAPI client bound to serverURL and bearer token.
@@ -146,13 +252,21 @@ func NewHTTPAPI(serverURL, token string, httpClient *http.Client) (*HTTPAPI, err
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("FILEDOCK_TOKEN must not be empty")
 	}
+	var clientCopy *http.Client
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		clientCopy, err = NewHTTPClient("")
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		c := *httpClient
+		c.CheckRedirect = bearerSafeCheckRedirect(httpClient.CheckRedirect)
+		clientCopy = &c
 	}
 	return &HTTPAPI{
 		baseURL: normalized,
 		token:   strings.TrimSpace(token),
-		client:  httpClient,
+		client:  clientCopy,
 	}, nil
 }
 

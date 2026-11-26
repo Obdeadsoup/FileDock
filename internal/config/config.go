@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -15,8 +16,53 @@ const (
 )
 
 type Config struct {
-	Addr    string
-	DataDir string
+	Addr        string
+	DataDir     string
+	TLSCertFile string
+	TLSKeyFile  string
+}
+
+// TLSEnabled reports whether TLS certificate and key paths are configured.
+func (c Config) TLSEnabled() bool {
+	return c.TLSCertFile != "" || c.TLSKeyFile != ""
+}
+
+// LoadTLSConfig loads and validates the configured TLS certificate and private key.
+// Returns (nil, nil) when TLS is not enabled.
+func (c Config) LoadTLSConfig() (*tls.Config, error) {
+	if !c.TLSEnabled() {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS key pair (cert=%q, key=%q): %w", c.TLSCertFile, c.TLSKeyFile, err)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}, nil
+}
+
+// IsLoopbackAddr reports whether a host:port listen address is bound strictly to a loopback host.
+func IsLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return IsLoopbackHost(host)
+}
+
+// IsLoopbackHost reports whether host is "localhost" or a loopback IP (127.0.0.0/8, ::1).
+func IsLoopbackHost(host string) bool {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" {
+		return false
+	}
+	if strings.EqualFold(trimmed, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(trimmed)
+	return ip != nil && ip.IsLoopback()
 }
 
 func Load() (Config, error) {
@@ -25,7 +71,7 @@ func Load() (Config, error) {
 		addr = defaultAddr
 	}
 
-	_, port, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid FILEDOCK_ADDR: %w", err)
 	}
@@ -41,8 +87,19 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid FILEDOCK_DATA_DIR: must not be empty")
 	}
 
+	certFile := strings.TrimSpace(os.Getenv("FILEDOCK_TLS_CERT_FILE"))
+	keyFile := strings.TrimSpace(os.Getenv("FILEDOCK_TLS_KEY_FILE"))
+	if (certFile == "") != (keyFile == "") {
+		return Config{}, fmt.Errorf("invalid TLS config: both FILEDOCK_TLS_CERT_FILE and FILEDOCK_TLS_KEY_FILE must be set together")
+	}
+	if !IsLoopbackHost(host) && certFile == "" {
+		return Config{}, fmt.Errorf("TLS is required when listening on non-loopback address %q: set FILEDOCK_TLS_CERT_FILE and FILEDOCK_TLS_KEY_FILE", addr)
+	}
+
 	return Config{
-		Addr:    addr,
-		DataDir: filepath.Clean(dataDir),
+		Addr:        addr,
+		DataDir:     filepath.Clean(dataDir),
+		TLSCertFile: certFile,
+		TLSKeyFile:  keyFile,
 	}, nil
 }

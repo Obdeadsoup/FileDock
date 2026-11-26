@@ -194,6 +194,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	); err != nil {
 		return files.Share{}, false, fmt.Errorf("insert share: %w", err)
 	}
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionShareCreate, files.ResourceTypeShare, shareID, nowUTC); err != nil {
+		return files.Share{}, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return files.Share{}, false, err
 	}
@@ -289,12 +292,18 @@ LIMIT ? OFFSET ?`
 	return result, nil
 }
 
-// DeleteShare revokes a share owned by ownerID.
+// DeleteShare revokes a share owned by ownerID and records the revocation in the same transaction.
 func (s *Store) DeleteShare(ctx context.Context, ownerID, shareID string) error {
 	if strings.TrimSpace(ownerID) == "" {
 		return files.ErrInvalidOwner
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM shares WHERE id = ? AND owner_id = ?`, shareID, ownerID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin delete share: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM shares WHERE id = ? AND owner_id = ?`, shareID, ownerID)
 	if err != nil {
 		return fmt.Errorf("delete share: %w", err)
 	}
@@ -305,7 +314,10 @@ func (s *Store) DeleteShare(ctx context.Context, ownerID, shareID string) error 
 	if affected == 0 {
 		return files.ErrShareNotFound
 	}
-	return nil
+	if err := appendAuditLog(ctx, tx, ownerID, files.AuditActionShareDelete, files.ResourceTypeShare, shareID, time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ListSharedFolders lists direct subfolders inside a shared folder subtree within a single read transaction.
