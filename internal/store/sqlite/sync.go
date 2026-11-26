@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sync_changes (
 	parent_id TEXT,
 	size INTEGER,
 	sha256 TEXT,
+	content_revision INTEGER,
 	resource_created_at TEXT,
 	resource_updated_at TEXT,
 	PRIMARY KEY (owner_id, seq)
@@ -116,7 +117,7 @@ ORDER BY owner_id ASC, depth ASC, created_at_ns ASC, id ASC`)
 		file    files.File
 	}
 	fileRows, err := tx.QueryContext(ctx, `
-SELECT owner_id, id, name, parent_id, size, sha256, created_at
+SELECT owner_id, id, name, parent_id, size, sha256, content_revision, created_at
 FROM files
 WHERE owner_id != '' AND owner_id IS NOT NULL
 ORDER BY owner_id ASC, created_at_ns ASC, id ASC`)
@@ -130,7 +131,7 @@ ORDER BY owner_id ASC, created_at_ns ASC, id ASC`)
 			createdStr   string
 			parentIDNull sql.NullString
 		)
-		if err := fileRows.Scan(&seed.ownerID, &seed.file.ID, &seed.file.Name, &parentIDNull, &seed.file.Size, &seed.file.SHA256, &createdStr); err != nil {
+		if err := fileRows.Scan(&seed.ownerID, &seed.file.ID, &seed.file.Name, &parentIDNull, &seed.file.Size, &seed.file.SHA256, &seed.file.ContentRevision, &createdStr); err != nil {
 			_ = fileRows.Close()
 			return fmt.Errorf("scan file for sync backfill: %w", err)
 		}
@@ -177,11 +178,15 @@ func appendFileUpsert(ctx context.Context, tx *sql.Tx, ownerID string, file file
 	if err != nil {
 		return err
 	}
+	rev := file.ContentRevision
+	if rev <= 0 {
+		rev = 1
+	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO sync_changes (
 	owner_id, seq, event_type, resource_id, occurred_at,
-	name, parent_id, size, sha256, resource_created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	name, parent_id, size, sha256, content_revision, resource_created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ownerID,
 		seq,
 		files.ChangeFileUpsert,
@@ -191,6 +196,7 @@ INSERT INTO sync_changes (
 		file.ParentID,
 		file.Size,
 		file.SHA256,
+		rev,
 		file.CreatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -280,7 +286,7 @@ func (s *Store) ListChanges(ctx context.Context, ownerID string, after int64, li
 
 	const query = `
 SELECT seq, event_type, resource_id, occurred_at,
-       name, parent_id, size, sha256, resource_created_at, resource_updated_at
+       name, parent_id, size, sha256, content_revision, resource_created_at, resource_updated_at
 FROM sync_changes
 WHERE owner_id = ? AND seq > ?
 ORDER BY seq ASC
@@ -306,6 +312,7 @@ LIMIT ?`
 			parentID   sql.NullString
 			size       sql.NullInt64
 			sha        sql.NullString
+			contentRev sql.NullInt64
 			resCreated sql.NullString
 			resUpdated sql.NullString
 		)
@@ -318,6 +325,7 @@ LIMIT ?`
 			&parentID,
 			&size,
 			&sha,
+			&contentRev,
 			&resCreated,
 			&resUpdated,
 		); err != nil {
@@ -342,13 +350,18 @@ LIMIT ?`
 			if err != nil {
 				return files.ChangePage{}, fmt.Errorf("parse sync file created_at %q: %w", resCreated.String, err)
 			}
+			rev := int64(1)
+			if contentRev.Valid && contentRev.Int64 > 0 {
+				rev = contentRev.Int64
+			}
 			ev.File = &files.File{
-				ID:        ev.ResourceID,
-				Name:      name.String,
-				ParentID:  parentPtr,
-				Size:      size.Int64,
-				SHA256:    sha.String,
-				CreatedAt: createdAt.UTC(),
+				ID:              ev.ResourceID,
+				Name:            name.String,
+				ParentID:        parentPtr,
+				Size:            size.Int64,
+				SHA256:          sha.String,
+				ContentRevision: rev,
+				CreatedAt:       createdAt.UTC(),
 			}
 		case files.ChangeFolderUpsert:
 			createdAt, err := time.Parse(time.RFC3339Nano, resCreated.String)

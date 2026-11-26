@@ -30,12 +30,13 @@ var (
 
 // File represents user-visible metadata for a stored file.
 type File struct {
-	ID        string
-	Name      string
-	ParentID  *string
-	Size      int64
-	SHA256    string
-	CreatedAt time.Time
+	ID              string
+	Name            string
+	ParentID        *string
+	Size            int64
+	SHA256          string
+	ContentRevision int64
+	CreatedAt       time.Time
 }
 
 // StoredFile pairs public file metadata with its owner ID and internal storage object key.
@@ -72,6 +73,7 @@ type MetadataStore interface {
 	CleanupAndSearchStore
 	ShareStore
 	SyncStore
+	ContentUpdateStore
 	Create(ctx context.Context, file StoredFile) error
 	List(ctx context.Context, ownerID string, page ListPage) ([]File, error)
 	GetByID(ctx context.Context, ownerID, id string) (StoredFile, error)
@@ -189,12 +191,13 @@ func (s *Service) UploadTo(ctx context.Context, ownerID string, parentID *string
 
 	record := StoredFile{
 		File: File{
-			ID:        id,
-			Name:      filename,
-			ParentID:  parentID,
-			Size:      staged.Size,
-			SHA256:    staged.SHA256,
-			CreatedAt: s.now().UTC(),
+			ID:              id,
+			Name:            filename,
+			ParentID:        parentID,
+			Size:            staged.Size,
+			SHA256:          staged.SHA256,
+			ContentRevision: 1,
+			CreatedAt:       s.now().UTC(),
 		},
 		OwnerID:   ownerID,
 		ObjectKey: staged.ObjectKey,

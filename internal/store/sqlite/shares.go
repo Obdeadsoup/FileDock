@@ -408,7 +408,7 @@ func (s *Store) ListSharedFiles(ctx context.Context, recipientID, shareID string
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, name, parent_id, size, sha256, created_at
+SELECT id, name, parent_id, size, sha256, content_revision, created_at
 FROM files
 WHERE owner_id = ? AND parent_id = ?
 ORDER BY created_at_ns DESC, id ASC
@@ -424,7 +424,7 @@ LIMIT ? OFFSET ?`, share.OwnerID, targetFolderID, page.Limit, page.Offset)
 			item         files.File
 			createdAtStr string
 		)
-		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &createdAtStr); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &item.ContentRevision, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan shared file row: %w", err)
 		}
 		parsedAt, err := time.Parse(time.RFC3339Nano, createdAtStr)

@@ -48,12 +48,13 @@ type loginResponse struct {
 }
 
 type fileResponse struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	ParentID  *string   `json:"parent_id"`
-	Size      int64     `json:"size"`
-	SHA256    string    `json:"sha256"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	ParentID        *string   `json:"parent_id"`
+	Size            int64     `json:"size"`
+	SHA256          string    `json:"sha256"`
+	ContentRevision int64     `json:"content_revision"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type errorResponse struct {
@@ -83,6 +84,7 @@ func NewHandler(fileSvc *files.Service, accountSvc *accounts.Service) http.Handl
 	mux.HandleFunc("GET /api/v1/files", h.listFiles)
 	mux.HandleFunc("GET /api/v1/files/search", h.searchFiles)
 	mux.HandleFunc("GET /api/v1/files/{id}/content", h.downloadFile)
+	mux.HandleFunc("PUT /api/v1/files/{id}/content", h.replaceFileContent)
 	mux.HandleFunc("PATCH /api/v1/files/{id}", h.updateFile)
 	mux.HandleFunc("DELETE /api/v1/files/{id}", h.deleteFile)
 	mux.HandleFunc("POST /api/v1/folders", h.createFolder)
@@ -355,6 +357,7 @@ func (h *handler) uploadFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		w.Header().Set("ETag", files.ContentETag(file))
 		writeJSON(w, http.StatusCreated, toFileResponse(file))
 		return
 	}
@@ -453,6 +456,7 @@ func (h *handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", formatAttachmentDisposition(file.Name))
 	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	w.Header().Set("ETag", files.ContentETag(file))
 	w.WriteHeader(http.StatusOK)
 
 	if r.Method != http.MethodHead {
@@ -538,13 +542,18 @@ func toUserResponse(u accounts.User) userResponse {
 }
 
 func toFileResponse(f files.File) fileResponse {
+	rev := f.ContentRevision
+	if rev <= 0 {
+		rev = 1
+	}
 	return fileResponse{
-		ID:        f.ID,
-		Name:      f.Name,
-		ParentID:  f.ParentID,
-		Size:      f.Size,
-		SHA256:    f.SHA256,
-		CreatedAt: f.CreatedAt.UTC(),
+		ID:              f.ID,
+		Name:            f.Name,
+		ParentID:        f.ParentID,
+		Size:            f.Size,
+		SHA256:          f.SHA256,
+		ContentRevision: rev,
+		CreatedAt:       f.CreatedAt.UTC(),
 	}
 }
 

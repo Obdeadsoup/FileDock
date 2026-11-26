@@ -96,8 +96,21 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 
 	if !exists {
 		state = newEmptyState(normalizedServer, me.ID)
-	} else if state.UserID != me.ID {
-		return Result{}, fmt.Errorf("%w: local=%q authenticated=%q", ErrUserMismatch, state.UserID, me.ID)
+		if err := ensureMetaDirs(root); err != nil {
+			return Result{}, err
+		}
+		// Persist initial bound state (cursor 0) before any mirror mutation so an interrupted
+		// first pull can safely resume without being rejected as a non-empty directory.
+		if err := saveStateAtomically(root, state); err != nil {
+			return Result{}, err
+		}
+	} else {
+		if state.UserID != me.ID {
+			return Result{}, fmt.Errorf("%w: local=%q authenticated=%q", ErrUserMismatch, state.UserID, me.ID)
+		}
+		if err := ensureMetaDirs(root); err != nil {
+			return Result{}, err
+		}
 	}
 
 	pageLimit := cfg.PageLimit
@@ -139,11 +152,7 @@ func Pull(ctx context.Context, cfg Config) (Result, error) {
 		EventsApplied: eventsApplied,
 	}
 
-	if err := ensureMetaDirs(root); err != nil {
-		return Result{}, err
-	}
-
-	if eventsApplied == 0 && exists {
+	if eventsApplied == 0 {
 		return result, nil
 	}
 
@@ -468,12 +477,13 @@ func applyEvent(folders map[string]FolderRecord, files map[string]FileRecord, ev
 		if ev.File != nil {
 			prev := files[ev.ResourceID]
 			files[ev.ResourceID] = FileRecord{
-				ID:        ev.ResourceID,
-				Name:      ev.File.Name,
-				ParentID:  cloneStrPtr(ev.File.ParentID),
-				Size:      ev.File.Size,
-				SHA256:    ev.File.SHA256,
-				LocalPath: prev.LocalPath,
+				ID:              ev.ResourceID,
+				Name:            ev.File.Name,
+				ParentID:        cloneStrPtr(ev.File.ParentID),
+				Size:            ev.File.Size,
+				SHA256:          ev.File.SHA256,
+				ContentRevision: ev.File.ContentRevision,
+				LocalPath:       prev.LocalPath,
 			}
 		}
 	case "file.delete":
@@ -643,20 +653,7 @@ func ensureFirstRunEmptyDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("inspect mirror directory: %w", err)
 	}
-	for _, entry := range entries {
-		if entry.Name() == metaDirName && entry.IsDir() {
-			// Allow a leftover .filedock/tmp from a previously interrupted initial sync.
-			metaEntries, err := os.ReadDir(dir + "/" + metaDirName)
-			if err != nil {
-				return fmt.Errorf("inspect %s directory: %w", metaDirName, err)
-			}
-			for _, me := range metaEntries {
-				if me.Name() != "tmp" || !me.IsDir() {
-					return fmt.Errorf("%w: %s", ErrDirNotEmpty, dir)
-				}
-			}
-			continue
-		}
+	if len(entries) > 0 {
 		return fmt.Errorf("%w: %s", ErrDirNotEmpty, dir)
 	}
 	return nil

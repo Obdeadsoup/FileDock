@@ -38,14 +38,15 @@ type FolderRecord struct {
 	LocalPath string  `json:"local_path"`
 }
 
-// FileRecord tracks a synced file by stable server ID, content SHA-256, and relative local path.
+// FileRecord tracks a synced file by stable server ID, content SHA-256, revision, and relative local path.
 type FileRecord struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	ParentID  *string `json:"parent_id"`
-	Size      int64   `json:"size"`
-	SHA256    string  `json:"sha256"`
-	LocalPath string  `json:"local_path"`
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	ParentID        *string `json:"parent_id"`
+	Size            int64   `json:"size"`
+	SHA256          string  `json:"sha256"`
+	ContentRevision int64   `json:"content_revision,omitempty"`
+	LocalPath       string  `json:"local_path"`
 }
 
 func newEmptyState(serverURL, userID string) State {

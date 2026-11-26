@@ -119,7 +119,8 @@ curl -i -H "Authorization: Bearer $TOKEN_A" http://127.0.0.1:8080/api/v1/files
 | `POST /api/v1/files` | 原有 multipart `file` 字段，可通过查询参数 `parent_id` 指定上传目录。 |
 | `GET /api/v1/files` | 可选查询参数 `parent_id`、`limit`、`offset`。返回 `200` 和直接文件数组。 |
 | `GET /api/v1/files/search` | 可选查询参数 `q`（区分大小写字面子串，支持中文，`%`/`_` 按普通字符匹配）、`min_size`、`max_size`、`parent_id`、`limit`、`offset`。默认搜索当前用户所有目录，指定 `parent_id` 时仅搜索该目录的直接文件。返回 `200` 和文件数组。 |
-| `PATCH /api/v1/files/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的文件元数据。原 ID 和下载 URL 继续有效。 |
+| `PATCH /api/v1/files/{id}` | JSON 中提供 `name`、`parent_id` 或两者。返回 `200` 和更新后的文件元数据。原 ID 和下载 URL 继续有效；改名和移动不增加 `content_revision`。 |
+| `PUT /api/v1/files/{id}/content` | 以流式请求体按原文件 ID 替换文件内容，必须携带从该文件 `GET`/`HEAD` 读取到的具体强 `ETag` 作为 `If-Match`（缺省 `428`、过期 `412`、无权/不存在 `404`、超限 `413`）。成功返回 `200`、新 `ETag` 与递增后的 `content_revision`。 |
 | `DELETE /api/v1/files/{id}` | 删除当前用户拥有的文件元数据并登记后台磁盘清理，返回 `204`；随后文件从列表/搜索消失且下载地址返回 `404`。 |
 | `POST /api/v1/shares` | JSON `{"resource_type":"file"\|"folder","resource_id":"...","recipient_username":"bob"}`。创建只读共享返回 `201`，重复创建返回已有授权（`200`）。 |
 | `GET /api/v1/shares` | 必填查询参数 `direction=sent\|received`，可选 `limit`、`offset`。返回 `200` 和共享授权数组。 |
@@ -249,7 +250,7 @@ FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock sync pull --server http://127.0.
 
 ### 首次运行与本地状态规则
 
-- **首次接管空目录**：目标目录不存在时自动创建；若目录非空且尚未初始化 `.filedock/state.json`，客户端直接报错退出，不接管已有文件。
+- **首次接管空目录**：目标目录不存在时自动创建；若目录非空且尚未初始化 `.filedock/state.json`，客户端直接报错退出，不接管已有文件。首次拉取在修改镜像目录前即先持久化与 `server_url`、`user_id` 绑定的初始状态（`cursor = 0`），因此即使首次发布文件后中途崩溃，重跑也可安全恢复收敛。
 - **状态绑定与安全**：客户端在镜像目录内通过 `os.Root` 受限根目录操作所有文件，将 `server_url`、`user_id`（来自 `GET /api/v1/auth/me`）、`cursor` 与按资源 ID 索引的清单原子写入 `.filedock/state.json`；**Bearer 令牌仅从环境变量 `FILEDOCK_TOKEN` 读取，不写入状态文件或日志**。服务端地址或用户不匹配时明确报错。
 - **本地命名映射规则**：
   - 同一父目录下名称唯一（按大小写折叠比较）且不与 `.filedock` 冲突的条目，保留原始名称。

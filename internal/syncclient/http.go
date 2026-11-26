@@ -30,12 +30,13 @@ type UserInfo struct {
 
 // FileMeta represents public file metadata in sync change events.
 type FileMeta struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	ParentID  *string   `json:"parent_id"`
-	Size      int64     `json:"size"`
-	SHA256    string    `json:"sha256"`
-	CreatedAt time.Time `json:"created_at"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	ParentID        *string   `json:"parent_id"`
+	Size            int64     `json:"size"`
+	SHA256          string    `json:"sha256"`
+	ContentRevision int64     `json:"content_revision,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // FolderMeta represents public folder metadata in sync change events.

@@ -140,7 +140,13 @@ CREATE INDEX IF NOT EXISTS idx_files_owner_created_at_ns_id
 	if err := migrateShares(ctx, tx); err != nil {
 		return err
 	}
+	if err := migrateFileContentRevision(ctx, tx); err != nil {
+		return err
+	}
 	if err := migrateSyncChanges(ctx, tx); err != nil {
+		return err
+	}
+	if err := migrateSyncContentRevision(ctx, tx); err != nil {
 		return err
 	}
 
@@ -361,9 +367,14 @@ func (s *Store) Create(ctx context.Context, file files.StoredFile) error {
 		return err
 	}
 	createdUTC := file.CreatedAt.UTC()
+	rev := file.ContentRevision
+	if rev <= 0 {
+		rev = 1
+		file.ContentRevision = 1
+	}
 	const query = `
-INSERT INTO files (id, owner_id, parent_id, name, size, sha256, object_key, created_at, created_at_ns)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+INSERT INTO files (id, owner_id, parent_id, name, size, sha256, object_key, content_revision, created_at, created_at_ns)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	_, err = tx.ExecContext(
 		ctx,
 		query,
@@ -374,6 +385,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		file.Size,
 		file.SHA256,
 		file.ObjectKey,
+		rev,
 		createdUTC.Format(time.RFC3339Nano),
 		createdUTC.UnixNano(),
 	)
@@ -392,7 +404,7 @@ func (s *Store) List(ctx context.Context, ownerID string, page files.ListPage) (
 		return nil, files.ErrInvalidOwner
 	}
 	const query = `
-SELECT id, name, parent_id, size, sha256, created_at
+SELECT id, name, parent_id, size, sha256, content_revision, created_at
 FROM files
 WHERE owner_id = ? AND parent_id IS ?
 ORDER BY created_at_ns DESC, id ASC
@@ -415,7 +427,7 @@ LIMIT ? OFFSET ?`
 			item         files.File
 			createdAtStr string
 		)
-		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &createdAtStr); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &item.ContentRevision, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan file row: %w", err)
 		}
 		parsedAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
@@ -441,7 +453,7 @@ func getFile(ctx context.Context, db rowQuerier, ownerID, id string) (files.Stor
 		return files.StoredFile{}, files.ErrNotFound
 	}
 	const query = `
-SELECT id, owner_id, name, parent_id, size, sha256, object_key, created_at
+SELECT id, owner_id, name, parent_id, size, sha256, object_key, content_revision, created_at
 FROM files
 WHERE id = ? AND owner_id = ?`
 
@@ -457,6 +469,7 @@ WHERE id = ? AND owner_id = ?`
 		&record.Size,
 		&record.SHA256,
 		&record.ObjectKey,
+		&record.ContentRevision,
 		&createdAtStr,
 	)
 	if err != nil {
@@ -494,7 +507,7 @@ func (s *Store) ClaimLegacyFiles(ctx context.Context, username string) (int64, e
 	}
 
 	legacyRows, err := tx.QueryContext(ctx, `
-SELECT id, name, size, sha256, created_at
+SELECT id, name, size, sha256, content_revision, created_at
 FROM files
 WHERE owner_id = '' OR owner_id IS NULL
 ORDER BY created_at_ns ASC, id ASC`)
@@ -507,7 +520,7 @@ ORDER BY created_at_ns ASC, id ASC`)
 			item       files.File
 			createdStr string
 		)
-		if err := legacyRows.Scan(&item.ID, &item.Name, &item.Size, &item.SHA256, &createdStr); err != nil {
+		if err := legacyRows.Scan(&item.ID, &item.Name, &item.Size, &item.SHA256, &item.ContentRevision, &createdStr); err != nil {
 			_ = legacyRows.Close()
 			return 0, fmt.Errorf("scan legacy file: %w", err)
 		}

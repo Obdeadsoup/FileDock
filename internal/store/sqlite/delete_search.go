@@ -174,7 +174,7 @@ func (s *Store) SearchFiles(ctx context.Context, ownerID string, filter files.Se
 		args = append(args, *filter.MaxSize)
 	}
 
-	query := `SELECT id, name, parent_id, size, sha256, created_at
+	query := `SELECT id, name, parent_id, size, sha256, content_revision, created_at
 FROM files
 WHERE ` + strings.Join(clauses, " AND ") + `
 ORDER BY created_at_ns DESC, id ASC
@@ -193,7 +193,7 @@ LIMIT ? OFFSET ?`
 			item         files.File
 			createdAtStr string
 		)
-		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &createdAtStr); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.ParentID, &item.Size, &item.SHA256, &item.ContentRevision, &createdAtStr); err != nil {
 			return nil, fmt.Errorf("scan search file row: %w", err)
 		}
 		parsedAt, err := time.Parse(time.RFC3339Nano, createdAtStr)

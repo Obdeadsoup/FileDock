@@ -496,3 +496,119 @@ func TestDirSafetyBindingMismatchAndStrangerProtection(t *testing.T) {
 		t.Fatalf("locally modified tracked.txt was deleted or overwritten: %q err=%v", gotTracked, err)
 	}
 }
+
+func TestFirstPullCrashAfterPublishRecoversAndProtectsNonEmptyDir(t *testing.T) {
+	ts := startTestServer(t)
+	ctx := context.Background()
+
+	dirFolder := ts.createFolder(t, ts.tokenA, "docs", nil)
+	_ = ts.uploadFile(t, ts.tokenA, &dirFolder, "first.txt", []byte("initial sync file"))
+
+	// 1. First pull into a brand-new empty directory crashes right after publishing files, before final state commit.
+	mirrorDir := t.TempDir()
+	injected := errors.New("simulated crash after publish on first pull")
+	_, err := syncclient.Pull(ctx, syncclient.Config{
+		ServerURL: ts.srv.URL,
+		Token:     ts.tokenA,
+		Dir:       mirrorDir,
+		AfterStepHook: func(step string) error {
+			if step == "after_publish" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("expected injected crash, got %v", err)
+	}
+	// Confirm file was already published on disk before the crash.
+	if _, statErr := os.Stat(filepath.Join(mirrorDir, "docs", "first.txt")); statErr != nil {
+		t.Fatalf("expected docs/first.txt to exist after publish step: %v", statErr)
+	}
+
+	// 2. Re-running Pull on the same directory must NOT fail with ErrDirNotEmpty; it reuses published file and converges.
+	res, err := syncclient.Pull(ctx, syncclient.Config{
+		ServerURL: ts.srv.URL,
+		Token:     ts.tokenA,
+		Dir:       mirrorDir,
+	})
+	if err != nil {
+		t.Fatalf("recovery pull after first-run publish crash failed: %v", err)
+	}
+	if res.Downloaded != 0 || res.Reused != 1 {
+		t.Fatalf("recovery pull = %+v, want Downloaded=0 Reused=1", res)
+	}
+
+	// 3. A genuinely non-empty directory with pre-existing user files is still rejected with ErrDirNotEmpty.
+	nonEmpty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nonEmpty, "preexisting.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncclient.Pull(ctx, syncclient.Config{ServerURL: ts.srv.URL, Token: ts.tokenA, Dir: nonEmpty}); !errors.Is(err, syncclient.ErrDirNotEmpty) {
+		t.Fatalf("pull into genuinely non-empty dir = %v, want ErrDirNotEmpty", err)
+	}
+}
+
+func TestTwoMirrorsSyncInPlaceContentUpdate(t *testing.T) {
+	ts := startTestServer(t)
+	ctx := context.Background()
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	fileID := ts.uploadFile(t, ts.tokenA, nil, "report.txt", []byte("version 1 content"))
+
+	// Mirror A syncs v1.
+	if _, err := syncclient.Pull(ctx, syncclient.Config{ServerURL: ts.srv.URL, Token: ts.tokenA, Dir: dirA}); err != nil {
+		t.Fatalf("dirA pull v1 error = %v", err)
+	}
+
+	// Read ETag and update content in place via PUT /api/v1/files/{id}/content.
+	headReq, _ := http.NewRequest(http.MethodHead, ts.srv.URL+"/api/v1/files/"+fileID+"/content", nil)
+	headReq.Header.Set("Authorization", "Bearer "+ts.tokenA)
+	headResp, err := http.DefaultClient.Do(headReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = headResp.Body.Close()
+	etag := headResp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("expected ETag on HEAD response")
+	}
+
+	v2Content := []byte("version 2 updated content in place")
+	putReq, _ := http.NewRequest(http.MethodPut, ts.srv.URL+"/api/v1/files/"+fileID+"/content", bytes.NewReader(v2Content))
+	putReq.Header.Set("Authorization", "Bearer "+ts.tokenA)
+	putReq.Header.Set("If-Match", etag)
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT content status = %d, want 200", putResp.StatusCode)
+	}
+
+	// Mirror A pulls incrementally (updates report.txt in place), Mirror B pulls from cursor 0.
+	resA, err := syncclient.Pull(ctx, syncclient.Config{ServerURL: ts.srv.URL, Token: ts.tokenA, Dir: dirA})
+	if err != nil {
+		t.Fatalf("dirA pull v2 error = %v", err)
+	}
+	if resA.Downloaded != 1 {
+		t.Fatalf("dirA pull v2 downloaded = %d, want 1", resA.Downloaded)
+	}
+
+	if _, err := syncclient.Pull(ctx, syncclient.Config{ServerURL: ts.srv.URL, Token: ts.tokenA, Dir: dirB}); err != nil {
+		t.Fatalf("dirB pull v2 error = %v", err)
+	}
+
+	dA, hA := snapshotMirror(t, dirA)
+	dB, hB := snapshotMirror(t, dirB)
+	if !reflect.DeepEqual(dA, dB) || !reflect.DeepEqual(hA, hB) {
+		t.Fatalf("mirrors diverged after in-place PUT:\nA=(%v, %v)\nB=(%v, %v)", dA, hA, dB, hB)
+	}
+	wantSum := sha256.Sum256(v2Content)
+	if hA["report.txt"] != hex.EncodeToString(wantSum[:]) {
+		t.Fatalf("report.txt hash = %q, want %q", hA["report.txt"], hex.EncodeToString(wantSum[:]))
+	}
+}

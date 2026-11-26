@@ -204,6 +204,7 @@ func (h *handler) downloadSharedFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", formatAttachmentDisposition(file.Name))
 	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	w.Header().Set("ETag", files.ContentETag(file))
 	w.WriteHeader(http.StatusOK)
 
 	if r.Method != http.MethodHead {

@@ -38,7 +38,8 @@ FileDock 是单 Go module。HTTP 服务只使用标准库；第三方包目前�
 | 目录和移动 | 认证会话，解析 JSON 与资源 ID，转换错误码 | `files` 校验名称和位置，向存储提交单个变更 | `sqlite` 在写入事务中检查归属、目录环路及删除前的子项，原子更新元数据 |
 | 搜索 | 认证会话，解析 `q`、`min_size`、`max_size`、`parent_id` 与分页参数，返回 JSON | `files` 校验过滤条件、目录 ID 和分页上限 | `sqlite` 在同一读取事务中校验可选目录归属，用参数化 `instr` 字面区分大小写查询 |
 | 删除文件 | 认证会话，解析文件 ID，返回 `204` 或映射错误码 | `files` 校验归属删除请求，并由后台清理循环分批执行磁盘删除 | `sqlite` 在同一写事务中删除元数据并登记 `blob_cleanups` 任务；`localdisk` 在事务外删除对象 |
-| 下载 | 认证会话取得用户 ID，解析文件标识，设置响应头并输出内容流 | `files` 先按 `(owner_id, id)` 校验归属并查询元数据，再取得内容流 | `sqlite` 按 `id` 与 `owner_id` 查找元数据，`localdisk` 打开内容流 |
+| 下载 | 认证会话取得用户 ID，解析文件标识，设置响应头（含内容版本强 `ETag`）并输出内容流 | `files` 先按 `(owner_id, id)` 校验归属并查询元数据，再取得内容流 | `sqlite` 按 `id` 与 `owner_id` 查找元数据，`localdisk` 打开内容流 |
+| 内容更新 | 认证会话，校验 `If-Match` 强 `ETag`（缺省 `428`、过期 `412`）并流式接收新正文 | `files` 预查权限与版本，写新对象后原子提交并回滚清理失败的新对象 | `localdisk` 在事务外写入新对象，`sqlite` 在写事务内复核版本、递增 `content_revision`、登记旧对象 `blob_cleanups` 并追加 `file.upsert` |
 | 共享与共享访问 | 认证会话，解析共享创建/列表/撤销及以 `share_id` 为范围的浏览和下载请求 | `files` 校验资源类型、接收者、方向与分页，先校验授权再打开磁盘流 | `sqlite` 在同一事务中校验所有者/接收者、目标资源和递归子树关系并隐藏外部父目录；`localdisk` 打开内容流 |
 | 增量同步 | 认证会话，解析 `after` 游标与 `limit`，返回 `items`、`next_cursor`、`has_more` | `files` 校验所有者、游标非负与分页上限 | `sqlite` 维护每用户独立递增 `seq`，在元数据写入同一事务中落库变更事件，用 `limit+1` 只读分页查询 |
 
