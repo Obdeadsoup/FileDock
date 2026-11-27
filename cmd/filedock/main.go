@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
+	"example.com/filedock/internal/gui"
 	"example.com/filedock/internal/syncclient"
 )
 
@@ -21,7 +24,7 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: filedock <sync pull|sync push|upload> [flags]")
+		return errors.New("usage: filedock <sync pull|sync push|upload|gui> [flags]")
 	}
 
 	switch args[0] {
@@ -39,8 +42,10 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 	case "upload":
 		return runUpload(ctx, args[1:], stdout)
+	case "gui":
+		return runGUI(ctx, args[1:], stdout)
 	default:
-		return fmt.Errorf("unknown command %q (expected sync or upload)", args[0])
+		return fmt.Errorf("unknown command %q (expected sync, upload, or gui)", args[0])
 	}
 }
 
@@ -204,4 +209,33 @@ func runUpload(ctx context.Context, args []string, stdout io.Writer) error {
 		res.File.SHA256,
 	)
 	return nil
+}
+
+func runGUI(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("gui", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	serverURL := fs.String("server", "", "FileDock server base URL")
+	localDir := fs.String("local-dir", "", "local root directory exposed in the left pane")
+	caCert := fs.String("ca-cert", "", "optional PEM CA certificate file for HTTPS verification")
+	listenAddr := fs.String("listen", "127.0.0.1:0", "local loopback listen address for the GUI")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments: %v", fs.Args())
+	}
+
+	srv, err := gui.NewServer(gui.Config{
+		ServerURL:  *serverURL,
+		LocalDir:   *localDir,
+		CACertFile: resolveCACert(*caCert),
+		ListenAddr: *listenAddr,
+	})
+	if err != nil {
+		return err
+	}
+
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return srv.Serve(runCtx, stdout)
 }

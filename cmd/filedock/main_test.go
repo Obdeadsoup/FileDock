@@ -21,4 +21,7 @@ func TestCLIValidation(t *testing.T) {
 	if err := run(context.Background(), []string{"upload", "--server", "http://127.0.0.1:8080", "--file", "/tmp/nonexistent"}, &out); err == nil {
 		t.Fatal("expected error when FILEDOCK_TOKEN is empty for upload")
 	}
+	if err := run(context.Background(), []string{"gui", "--server", "http://127.0.0.1:8080", "--local-dir", t.TempDir(), "--listen", "0.0.0.0:9090"}, &out); err == nil {
+		t.Fatal("expected error when GUI --listen is non-loopback")
+	}
 }

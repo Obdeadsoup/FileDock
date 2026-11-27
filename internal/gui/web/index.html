@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="gui-csrf" content="__GUI_CSRF_TOKEN__">
+  <title>FileDock Dual-Pane File Manager</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-title">FileDock</span>
+      <span id="server-badge" class="badge">Connecting...</span>
+    </div>
+    <div id="auth-guest" class="auth-bar">
+      <input id="auth-username" type="text" placeholder="Username" autocomplete="username">
+      <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password">
+      <button id="btn-login" class="btn primary">Login</button>
+      <button id="btn-register" class="btn">Register</button>
+    </div>
+    <div id="auth-user" class="auth-bar hidden">
+      <span id="current-user-label" class="user-pill"></span>
+      <button id="btn-logout" class="btn danger">Logout</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden" role="status"></div>
+
+  <main class="workspace">
+    <!-- Left Pane: Local Directory -->
+    <section class="pane" id="local-pane">
+      <div class="pane-header">
+        <h2>Local Directory</h2>
+        <span id="local-root-hint" class="muted"></span>
+      </div>
+      <nav id="local-breadcrumbs" class="breadcrumbs"></nav>
+      <div class="toolbar">
+        <button id="btn-local-refresh" class="btn sm">Refresh</button>
+        <button id="btn-local-mkdir" class="btn sm">New Folder</button>
+        <button id="btn-local-rename" class="btn sm">Rename / Move</button>
+        <button id="btn-local-delete" class="btn sm danger">Delete</button>
+        <span class="sep"></span>
+        <button id="btn-upload-simple" class="btn sm primary">Upload →</button>
+        <button id="btn-upload-resumable" class="btn sm primary">Chunked Upload →</button>
+        <button id="btn-replace-remote" class="btn sm">Replace Remote (If-Match)</button>
+      </div>
+      <div class="table-wrap">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Size</th>
+              <th>Modified</th>
+              <th>Permissions</th>
+            </tr>
+          </thead>
+          <tbody id="local-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Right Pane: Remote Directory & Received Shares -->
+    <section class="pane" id="remote-pane">
+      <div class="pane-header">
+        <div class="tabs">
+          <button id="tab-remote-files" class="tab active">Remote Files</button>
+          <button id="tab-remote-shares" class="tab">Received Shares (Read-Only)</button>
+        </div>
+      </div>
+      <nav id="remote-breadcrumbs" class="breadcrumbs"></nav>
+
+      <div id="remote-search-bar" class="search-bar">
+        <input id="search-q" type="text" placeholder="Search filename...">
+        <input id="search-min" type="number" min="0" placeholder="Min bytes">
+        <input id="search-max" type="number" min="0" placeholder="Max bytes">
+        <button id="btn-remote-search" class="btn sm">Search</button>
+        <button id="btn-remote-clear-search" class="btn sm">Clear</button>
+      </div>
+
+      <div id="remote-toolbar" class="toolbar">
+        <button id="btn-remote-refresh" class="btn sm">Refresh</button>
+        <button id="btn-remote-mkdir" class="btn sm">New Folder</button>
+        <button id="btn-remote-rename" class="btn sm">Rename / Move</button>
+        <button id="btn-remote-share" class="btn sm">Share</button>
+        <button id="btn-remote-delete" class="btn sm danger">Delete</button>
+        <span class="sep"></span>
+        <button id="btn-download-remote" class="btn sm primary">← Download</button>
+      </div>
+
+      <div id="shares-toolbar" class="toolbar hidden">
+        <button id="btn-shares-refresh" class="btn sm">Refresh Shares</button>
+        <button id="btn-shares-back" class="btn sm hidden">← All Shares</button>
+        <span class="sep"></span>
+        <button id="btn-download-shared" class="btn sm primary">← Download Shared File</button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="file-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Size</th>
+              <th>Time</th>
+              <th>Permissions / Info</th>
+            </tr>
+          </thead>
+          <tbody id="remote-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Resumable Upload & Transfer Panel -->
+  <section class="transfer-panel">
+    <div class="transfer-row">
+      <strong>Resumable Upload Transfer</strong>
+      <span id="job-status-text" class="muted">No active chunked upload</span>
+      <div class="transfer-actions">
+        <button id="btn-job-cancel" class="btn sm danger hidden">Interrupt / Pause</button>
+      </div>
+    </div>
+    <div class="progress-track">
+      <div id="job-progress-bar" class="progress-fill" style="width:0%"></div>
+    </div>
+    <div class="resume-form">
+      <label>Session ID:</label>
+      <input id="resume-session-id" type="text" placeholder="Upload session ID">
+      <label>Local File:</label>
+      <input id="resume-local-path" type="text" placeholder="Relative local path">
+      <button id="btn-resume-upload" class="btn sm primary">Resume Upload</button>
+    </div>
+  </section>
+
+  <!-- Confirmation Modal (Delete) -->
+  <div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="confirm-title">Confirm Action</h3>
+      <p id="confirm-message"></p>
+      <div class="modal-actions">
+        <button id="btn-confirm-cancel" class="btn">Cancel</button>
+        <button id="btn-confirm-ok" class="btn danger">Confirm Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Conflict Modal (Same-Name Download) -->
+  <div id="conflict-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3>File Already Exists Locally</h3>
+      <p id="conflict-message"></p>
+      <div class="modal-actions">
+        <button id="btn-conflict-cancel" class="btn">Cancel</button>
+        <button id="btn-conflict-rename" class="btn primary">Save With New Name</button>
+        <button id="btn-conflict-overwrite" class="btn danger">Overwrite Existing</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Input Modal (New Folder / Rename / Move / Share) -->
+  <div id="input-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="input-modal-title">Edit</h3>
+      <div id="input-modal-fields" class="modal-fields"></div>
+      <div class="modal-actions">
+        <button id="btn-input-cancel" class="btn">Cancel</button>
+        <button id="btn-input-ok" class="btn primary">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

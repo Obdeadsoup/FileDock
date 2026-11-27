@@ -1,9 +1,9 @@
 # FileDock
 
-《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分块上传与断点续传、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口、Go 命令行客户端拉取同步/显式推送/断点续传上传（`cmd/filedock`），以及旧文件显式认领。
+《网络系统实践》课程的网络文件系统项目。当前支持账户与 Bearer 会话、目录管理、文件上传、分块上传与断点续传、服务端 Tink Streaming AEAD 落盘加密、HTTPS/TLS 与操作审计、分页列表、搜索过滤、流式下载、重命名、移动、删除及后台磁盘清理、指定账号只读共享、个人目录增量同步接口、Go 命令行客户端（`sync pull`/`sync push`/`upload`）与双栏图形化文件管理器（`filedock gui`），以及旧文件显式认领。
 
 > [!NOTE]
-> 当前以本机 HTTP 为开发与验收环境。收到的共享同步、后台轮询与 GUI 留待后续轮次。
+> 当前以本机 HTTP / 本地测试 CA HTTPS 为开发与验收环境。收到的共享同步与后台轮询留待后续轮次。
 
 ## 启动服务
 
@@ -365,6 +365,29 @@ FILEDOCK_TOKEN="$TOKEN_A" go run ./cmd/filedock upload \
 
 - 分块字节存放在数据目录独立暂存区 `uploads/<session_id>/`，会话与已确认分块持久化在 SQLite，后台清理任务定期回收已过期未完成会话的暂存分块与记录。
 - 完成上传时在写事务外流式组装并校验整文件大小和 SHA-256，校验通过后在同一 SQLite 事务中登记文件、追加单条 `file.upsert` 并保留完成结果以支持重试幂等。
+
+### 双栏图形化文件管理器（`filedock gui`）
+
+使用 `filedock gui` 在本机 `127.0.0.1` 启动内置静态资源的双栏文件管理器（运行时无需任何前端构建服务）：
+
+```sh
+# 1. 启动 FileDock 服务端（回环 HTTP 或带 TLS 的 HTTPS）
+go run ./cmd/filedockd
+
+# 2. 启动本机双栏 GUI（访问终端输出的 http://127.0.0.1:<port>）
+go run ./cmd/filedock gui \
+  --server http://127.0.0.1:8080 \
+  --local-dir /tmp/my-local-dir
+
+# 若服务端使用本地测试 CA 启用 HTTPS，附加 --ca-cert（或环境变量 FILEDOCK_CA_CERT）
+go run ./cmd/filedock gui \
+  --server https://127.0.0.1:8443 \
+  --local-dir /tmp/my-local-dir \
+  --ca-cert ./certs/ca.pem
+```
+
+- **安全边界**：远端 Bearer 令牌仅保存在本机 Go 进程内存中，不向浏览器暴露；所有本地 `/api/gui/...` 接口均校验 `HttpOnly` 本地会话 Cookie、`X-FileDock-GUI-Token` 头与同源 `Origin`/`Sec-Fetch-Site`；本地目录通过 `os.Root` 严格限制在 `--local-dir` 内，隐藏并禁止访问/删除 `.filedock` 同步状态目录。
+- **双栏功能**：左栏浏览与管理本机目录，右栏支持远程个人文件（面包屑导航、名称/大小搜索、建目录、改名、移动、分享、带确认框删除、`If-Match` 内容替换及 412 冲突提示）与只读的 **Received Shares** 标签页；下载先写临时文件并校验 SHA-256，同名时弹出覆盖/改名/取消选择框；支持普通上传与带进度、会话 ID、中断/恢复的分块断点续传。
 
 ## 旧数据迁移与显式认领
 

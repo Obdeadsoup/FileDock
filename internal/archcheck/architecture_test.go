@@ -37,6 +37,7 @@ var packageLayers = map[string]layer{
 	"internal/store/sqlite":    store,
 	"internal/store/localdisk": store,
 	"internal/syncclient":      client,
+	"internal/gui":             client,
 }
 
 var businessStdlib = []string{
@@ -123,6 +124,10 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 		return ""
 	case httpapi, store:
 		if to == business {
+			return ""
+		}
+	case client:
+		if importer == modulePath+"/internal/gui" && imported == modulePath+"/internal/syncclient" {
 			return ""
 		}
 	}
@@ -216,6 +221,7 @@ func TestDependencyRules(t *testing.T) {
 		sqlite     = module + "/internal/store/sqlite"
 		disk       = module + "/internal/store/localdisk"
 		syncClient = module + "/internal/syncclient"
+		guiPkg     = module + "/internal/gui"
 		unknown    = module + "/internal/unknown"
 	)
 	for _, tc := range []struct {
@@ -227,10 +233,21 @@ func TestDependencyRules(t *testing.T) {
 		{entry, disk, false, false},
 		{entry, accounts, false, false},
 		{entry, syncClient, false, true},
+		{entry, guiPkg, false, true},
 		{cliEntry, syncClient, false, false},
+		{cliEntry, guiPkg, false, false},
 		{cliEntry, files, false, true},
 		{cliEntry, sqlite, false, true},
 		{cliEntry, api, false, true},
+		{guiPkg, syncClient, false, false},
+		{guiPkg, "net/http", true, false},
+		{guiPkg, "embed", true, false},
+		{guiPkg, files, false, true},
+		{guiPkg, accounts, false, true},
+		{guiPkg, sqlite, false, true},
+		{guiPkg, disk, false, true},
+		{guiPkg, api, false, true},
+		{syncClient, guiPkg, false, true},
 		{syncClient, "net/http", true, false},
 		{syncClient, "os", true, false},
 		{syncClient, files, false, true},
