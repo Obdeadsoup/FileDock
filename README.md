@@ -18,8 +18,30 @@ go run ./cmd/filedockd
 - `FILEDOCK_ADDR`：监听地址，默认 `127.0.0.1:8080`（格式为 `主机:端口`，如 `127.0.0.1:9090` 或 `[::1]:9090`，端口 `0` 由系统分配）。监听非回环地址（如 `0.0.0.0:8443`）时**必须**配置 TLS，否则启动直接报错。
 - `FILEDOCK_DATA_DIR`：本地数据目录，默认 `./data`（用于保存 `objects/`、`tmp/`、`uploads/` 和 `filedock.db`，已通过 `.gitignore` 忽略，不提交到 Git）。
 - `FILEDOCK_TLS_CERT_FILE` / `FILEDOCK_TLS_KEY_FILE`：可选的 TLS 证书与私钥 PEM 文件路径；两者同时配置时启用 HTTPS（TLS 1.2+），仅配置其一或文件无效时启动报错。
+- `FILEDOCK_ENCRYPTION_KEY_FILE`：可选的 Tink Streaming AEAD 密钥集 JSON 文件路径，用于启用服务端落盘加密。密钥文件必须位于 `FILEDOCK_DATA_DIR` 之外，且权限不得对组/其他用户开放（须为 `0600`/`0400`）。
 
 使用 `Ctrl+C` 停止服务，服务最多等待 5 秒完成正在处理的请求。
+
+### 服务端文件落盘加密（Tink Streaming AEAD）
+
+服务端支持在新数据目录启用透明落盘加密（`AES-256-GCM-HKDF-4KB`）：正式文件、普通上传与内容替换的临时文件、断点续传暂存分块均在写入磁盘前直接流式加密，组装时流式解密分块再流式加密最终对象，服务端磁盘不落明文中间件。SHA-256、文件大小与内容版本仍按明文字节计算，所有 HTTP/CLI API 保持不变。
+
+生成密钥文件并启动加密模式服务：
+
+```sh
+# 1. 在数据目录之外生成 0600 权限的 Tink Streaming AEAD 密钥文件
+go run ./cmd/filedockd keygen --out ./secrets/master.keyset.json
+
+# 2. 使用新数据目录启动加密服务
+FILEDOCK_DATA_DIR=./data-enc \
+FILEDOCK_ENCRYPTION_KEY_FILE=./secrets/master.keyset.json \
+go run ./cmd/filedockd
+```
+
+- 数据目录首次初始化时会在 `storage_mode.json` 持久化存储模式（`plaintext` 或 `encrypted`）及密钥校验哨兵：
+  - 已有明文数据目录继续按明文模式运行，直接配置加密密钥切换会明确报错。
+  - 已加密数据目录在未提供密钥或密钥不匹配时拒绝启动。
+- 每个对象以 `filedock:v1:object:<object_key>`、每个暂存分块以 `filedock:v1:chunk:<session_id>:<index>:<storage_key>` 作为 AEAD 关联认证数据（AAD），防止不同对象或分块之间的密文互换；磁盘密文若被篡改，下载时服务端会认证失败并中止响应，客户端可立即检测到失败。
 
 ### HTTPS 与本地测试 CA
 
@@ -34,7 +56,7 @@ go run ./cmd/filedockd
 
 命令行客户端 `filedock upload`、`filedock sync pull`、`filedock sync push` 共用 HTTPS 客户端配置：
 - 默认校验证书链与主机名，可通过 `--ca-cert <path>` 或环境变量 `FILEDOCK_CA_CERT` 加载本地测试 CA。
-- Bearer 认证请求仅允许通过 HTTPS 或回环 HTTP（`localhost` / `127.0.0.0/8` / `::1`）发送；重定向同样受该规则约束，且跨源重定向自动剥离 `Authorization` 头。
+- Bearer 认证请求仅允许通过 HTTPS 或回环 HTTP（`localhost` / `127.0.0.0/8` / `::1`）发送；重定向同样受该规则约束，且直接拒绝任何跨源重定向（包括 `307`/`308` 可重放正文场景），确保令牌与请求体都不会发送到其他源。
 
 在 PowerShell 中覆盖监听地址与数据目录：
 

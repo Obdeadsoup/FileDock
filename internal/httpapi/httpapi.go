@@ -458,20 +458,54 @@ func (h *handler) downloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
+	streamContentResponse(w, r, file, rc, true)
+}
+
+func streamContentResponse(w http.ResponseWriter, r *http.Request, file files.File, rc io.Reader, includeVersionHeaders bool) {
+	var (
+		firstChunk []byte
+		firstErr   error
+	)
+	if r.Method != http.MethodHead {
+		buf := make([]byte, 32*1024)
+		n, err := rc.Read(buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusInternalServerError, "failed to read file content")
+			return
+		}
+		firstChunk = buf[:n]
+		firstErr = err
+	}
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", formatAttachmentDisposition(file.Name))
 	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
 	w.Header().Set("ETag", files.ContentETag(file))
-	rev := file.ContentRevision
-	if rev <= 0 {
-		rev = 1
+	if includeVersionHeaders {
+		rev := file.ContentRevision
+		if rev <= 0 {
+			rev = 1
+		}
+		w.Header().Set("X-FileDock-Content-Revision", strconv.FormatInt(rev, 10))
+		w.Header().Set("X-FileDock-SHA256", file.SHA256)
 	}
-	w.Header().Set("X-FileDock-Content-Revision", strconv.FormatInt(rev, 10))
-	w.Header().Set("X-FileDock-SHA256", file.SHA256)
 	w.WriteHeader(http.StatusOK)
 
-	if r.Method != http.MethodHead {
-		_, _ = io.Copy(w, rc)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if len(firstChunk) > 0 {
+		if _, err := w.Write(firstChunk); err != nil {
+			return
+		}
+	}
+	if errors.Is(firstErr, io.EOF) {
+		return
+	}
+	if _, err := io.Copy(w, rc); err != nil {
+		if r.Context().Value(http.ServerContextKey) != nil {
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 

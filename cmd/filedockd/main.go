@@ -39,11 +39,34 @@ func run(args []string, stdout io.Writer, logger *slog.Logger) error {
 			return runClaimLegacy(args[1:], stdout, logger)
 		case "audit":
 			return runAudit(args[1:], stdout, logger)
+		case "keygen":
+			return runKeygen(args[1:], stdout)
 		default:
 			return fmt.Errorf("unknown command %q", args[0])
 		}
 	}
 	return runServer(logger)
+}
+
+func runKeygen(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	outPath := fs.String("out", "", "output path for the new Tink Streaming AEAD keyset file (mode 0600)")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("parse keygen flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected arguments for keygen: %v", fs.Args())
+	}
+	target := strings.TrimSpace(*outPath)
+	if target == "" {
+		return errors.New("keygen requires --out <key-file-path>")
+	}
+	if err := localdisk.GenerateKeysetFile(target); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(stdout, "generated encryption keyset at %s (mode 0600)\n", target)
+	return nil
 }
 
 func runAudit(args []string, stdout io.Writer, logger *slog.Logger) error {
@@ -165,7 +188,7 @@ func runServer(logger *slog.Logger) error {
 		return err
 	}
 
-	blobStore, err := localdisk.NewStore(cfg.DataDir)
+	blobStore, err := localdisk.NewStoreWithConfig(cfg.DataDir, cfg.EncryptionKeyFile)
 	if err != nil {
 		return fmt.Errorf("init localdisk store: %w", err)
 	}
@@ -225,10 +248,10 @@ func runServer(logger *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	if tlsCfg != nil {
 		go func() { serveErr <- server.ServeTLS(listener, "", "") }()
-		logger.Info("HTTPS server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir)
+		logger.Info("HTTPS server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir, "storage_mode", blobStore.Mode())
 	} else {
 		go func() { serveErr <- server.Serve(listener) }()
-		logger.Info("HTTP server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir)
+		logger.Info("HTTP server listening", "addr", listener.Addr().String(), "data_dir", cfg.DataDir, "storage_mode", blobStore.Mode())
 	}
 
 	select {

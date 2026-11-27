@@ -11,18 +11,30 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/tink-crypto/tink-go/v2/tink"
+
 	"example.com/filedock/internal/files"
 )
 
 // Store persists file payloads on the local filesystem using server-generated keys.
+// When initialized with an encryption key file, all formal objects, temp upload files,
+// and staged upload chunks are encrypted on disk with Tink Streaming AEAD.
 type Store struct {
 	objectsDir string
 	tmpDir     string
 	uploadsDir string
+	mode       string
+	aead       tink.StreamingAEAD
 }
 
-// NewStore initializes object, staging, and chunk upload directories under dataDir.
+// NewStore initializes a localdisk Store in plaintext mode (compatible with existing callers and tests).
 func NewStore(dataDir string) (*Store, error) {
+	return NewStoreWithConfig(dataDir, "")
+}
+
+// NewStoreWithConfig initializes object, staging, and chunk upload directories under dataDir,
+// enforcing persisted storage mode compatibility and optional Tink Streaming AEAD encryption.
+func NewStoreWithConfig(dataDir, encryptionKeyFile string) (*Store, error) {
 	if dataDir == "" {
 		return nil, errors.New("data dir must not be empty")
 	}
@@ -38,11 +50,24 @@ func NewStore(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create uploads dir: %w", err)
 	}
+
+	mode, aead, err := initStorageMode(dataDir, encryptionKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Store{
 		objectsDir: objectsDir,
 		tmpDir:     tmpDir,
 		uploadsDir: uploadsDir,
+		mode:       mode,
+		aead:       aead,
 	}, nil
+}
+
+// Mode returns the active storage mode ("plaintext" or "encrypted").
+func (s *Store) Mode() string {
+	return s.mode
 }
 
 type ctxReader struct {
@@ -57,7 +82,8 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-// Save streams r to a temporary file while hashing and enforcing maxBytes, then commits it to objects/.
+// Save streams r to a temporary file while hashing plaintext and enforcing maxBytes, then commits it to objects/.
+// In encrypted mode, the temporary file is stream-encrypted directly with AAD bound to the pre-generated objectKey.
 func (s *Store) Save(ctx context.Context, r io.Reader, maxBytes int64) (files.StagedBlob, error) {
 	if err := ctx.Err(); err != nil {
 		return files.StagedBlob{}, err
@@ -67,6 +93,11 @@ func (s *Store) Save(ctx context.Context, r io.Reader, maxBytes int64) (files.St
 	}
 	if r == nil {
 		return files.StagedBlob{}, errors.New("reader must not be nil")
+	}
+
+	objectKey, err := generateObjectKey()
+	if err != nil {
+		return files.StagedBlob{}, fmt.Errorf("generate object key: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp(s.tmpDir, "upload-*")
@@ -85,15 +116,38 @@ func (s *Store) Save(ctx context.Context, r io.Reader, maxBytes int64) (files.St
 		}
 	}()
 
+	var (
+		dstWriter io.Writer = tmpFile
+		encWriter io.WriteCloser
+	)
+	if s.aead != nil {
+		encWriter, err = s.aead.NewEncryptingWriter(tmpFile, objectAAD(objectKey))
+		if err != nil {
+			return files.StagedBlob{}, fmt.Errorf("init object encrypting writer: %w", err)
+		}
+		dstWriter = encWriter
+	}
+
 	hasher := sha256.New()
 	limited := io.LimitReader(ctxReader{ctx: ctx, r: r}, maxBytes+1)
 	buf := make([]byte, 32*1024)
-	written, err := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), limited, buf)
+	written, err := io.CopyBuffer(io.MultiWriter(dstWriter, hasher), limited, buf)
 	if err != nil {
+		if encWriter != nil {
+			_ = encWriter.Close()
+		}
 		return files.StagedBlob{}, err
 	}
 	if written > maxBytes {
+		if encWriter != nil {
+			_ = encWriter.Close()
+		}
 		return files.StagedBlob{}, files.ErrFileTooLarge
+	}
+	if encWriter != nil {
+		if err := encWriter.Close(); err != nil {
+			return files.StagedBlob{}, fmt.Errorf("finalize object encryption: %w", err)
+		}
 	}
 	if err := tmpFile.Sync(); err != nil {
 		return files.StagedBlob{}, fmt.Errorf("sync temp file: %w", err)
@@ -104,10 +158,6 @@ func (s *Store) Save(ctx context.Context, r io.Reader, maxBytes int64) (files.St
 	}
 	closed = true
 
-	objectKey, err := generateObjectKey()
-	if err != nil {
-		return files.StagedBlob{}, fmt.Errorf("generate object key: %w", err)
-	}
 	finalPath := filepath.Join(s.objectsDir, objectKey)
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return files.StagedBlob{}, fmt.Errorf("commit object: %w", err)
@@ -122,6 +172,7 @@ func (s *Store) Save(ctx context.Context, r io.Reader, maxBytes int64) (files.St
 }
 
 // Open returns a ReadCloser for the object identified by objectKey.
+// In encrypted mode, the stream is authenticated and decrypted with AAD bound to objectKey.
 func (s *Store) Open(ctx context.Context, objectKey string) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -135,6 +186,14 @@ func (s *Store) Open(ctx context.Context, objectKey string) (io.ReadCloser, erro
 			return nil, files.ErrNotFound
 		}
 		return nil, fmt.Errorf("open object: %w", err)
+	}
+	if s.aead != nil {
+		decReader, err := s.aead.NewDecryptingReader(f, objectAAD(objectKey))
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("init object decrypting reader: %w", err)
+		}
+		return &decryptReadCloser{r: decReader, f: f}, nil
 	}
 	return f, nil
 }

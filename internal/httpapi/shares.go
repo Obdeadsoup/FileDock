@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"time"
 
 	"example.com/filedock/internal/files"
@@ -201,15 +200,7 @@ func (h *handler) downloadSharedFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", formatAttachmentDisposition(file.Name))
-	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
-	w.Header().Set("ETag", files.ContentETag(file))
-	w.WriteHeader(http.StatusOK)
-
-	if r.Method != http.MethodHead {
-		_, _ = io.Copy(w, rc)
-	}
+	streamContentResponse(w, r, file, rc, false)
 }
 
 func writeShareError(w http.ResponseWriter, err error, fallback string) {

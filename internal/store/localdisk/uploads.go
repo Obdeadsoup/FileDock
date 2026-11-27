@@ -16,8 +16,7 @@ import (
 
 // SaveChunk streams a single upload chunk into a unique per-request file inside the session's
 // staging directory, enforcing exact expectedSize and optional expectedSHA256.
-// Because each request gets its own unique StorageKey, cleaning up a failed or duplicate request
-// can never delete a previously confirmed chunk.
+// In encrypted mode, the staged chunk is stream-encrypted directly with AAD bound to (sessionID, index, storageKey).
 func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io.Reader, expectedSize int64, expectedSHA256 string) (files.UploadChunk, error) {
 	if err := ctx.Err(); err != nil {
 		return files.UploadChunk{}, err
@@ -34,6 +33,12 @@ func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io
 	if r == nil {
 		return files.UploadChunk{}, files.ErrChunkSizeMismatch
 	}
+
+	nonce, err := generateObjectKey()
+	if err != nil {
+		return files.UploadChunk{}, fmt.Errorf("generate chunk storage key: %w", err)
+	}
+	storageKey := fmt.Sprintf("%d-%s.chunk", index, nonce)
 
 	sessionDir := filepath.Join(s.uploadsDir, sessionID)
 	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
@@ -56,22 +61,48 @@ func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io
 		}
 	}()
 
+	var (
+		dstWriter io.Writer = tmpFile
+		encWriter io.WriteCloser
+	)
+	if s.aead != nil {
+		encWriter, err = s.aead.NewEncryptingWriter(tmpFile, chunkAAD(sessionID, index, storageKey))
+		if err != nil {
+			return files.UploadChunk{}, fmt.Errorf("init chunk encrypting writer: %w", err)
+		}
+		dstWriter = encWriter
+	}
+
 	hasher := sha256.New()
 	limited := io.LimitReader(ctxReader{ctx: ctx, r: r}, expectedSize+1)
 	buf := make([]byte, 32*1024)
-	written, err := io.CopyBuffer(io.MultiWriter(tmpFile, hasher), limited, buf)
+	written, err := io.CopyBuffer(io.MultiWriter(dstWriter, hasher), limited, buf)
 	if err != nil {
+		if encWriter != nil {
+			_ = encWriter.Close()
+		}
 		return files.UploadChunk{}, err
 	}
 	if written != expectedSize {
+		if encWriter != nil {
+			_ = encWriter.Close()
+		}
 		return files.UploadChunk{}, fmt.Errorf("%w: got %d bytes, expected %d", files.ErrChunkSizeMismatch, written, expectedSize)
 	}
 
 	actualSHA := hex.EncodeToString(hasher.Sum(nil))
 	if expectedSHA256 != "" && actualSHA != expectedSHA256 {
+		if encWriter != nil {
+			_ = encWriter.Close()
+		}
 		return files.UploadChunk{}, fmt.Errorf("%w: got %s, expected %s", files.ErrChunkHashMismatch, actualSHA, expectedSHA256)
 	}
 
+	if encWriter != nil {
+		if err := encWriter.Close(); err != nil {
+			return files.UploadChunk{}, fmt.Errorf("finalize chunk encryption: %w", err)
+		}
+	}
 	if err := tmpFile.Sync(); err != nil {
 		return files.UploadChunk{}, fmt.Errorf("sync chunk temp file: %w", err)
 	}
@@ -81,11 +112,6 @@ func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io
 	}
 	closed = true
 
-	nonce, err := generateObjectKey()
-	if err != nil {
-		return files.UploadChunk{}, fmt.Errorf("generate chunk storage key: %w", err)
-	}
-	storageKey := fmt.Sprintf("%d-%s.chunk", index, nonce)
 	finalPath := filepath.Join(sessionDir, storageKey)
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return files.UploadChunk{}, fmt.Errorf("commit chunk file: %w", err)
@@ -101,8 +127,8 @@ func (s *Store) SaveChunk(ctx context.Context, sessionID string, index int, r io
 	}, nil
 }
 
-// OpenChunk opens a previously confirmed chunk file using its recorded StorageKey
-// (falling back to legacy <index>-<sha256>.chunk if StorageKey is empty).
+// OpenChunk opens a previously confirmed chunk file using its recorded StorageKey.
+// In encrypted mode, the chunk stream is authenticated and decrypted with AAD bound to (sessionID, index, storageKey).
 func (s *Store) OpenChunk(ctx context.Context, sessionID string, chunk files.UploadChunk) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -126,6 +152,14 @@ func (s *Store) OpenChunk(ctx context.Context, sessionID string, chunk files.Upl
 			return nil, fmt.Errorf("%w: chunk %d missing on disk", files.ErrIncompleteUpload, chunk.Index)
 		}
 		return nil, fmt.Errorf("open chunk %d: %w", chunk.Index, err)
+	}
+	if s.aead != nil {
+		decReader, err := s.aead.NewDecryptingReader(f, chunkAAD(sessionID, chunk.Index, key))
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("init chunk decrypting reader: %w", err)
+		}
+		return &decryptReadCloser{r: decReader, f: f}, nil
 	}
 	return f, nil
 }

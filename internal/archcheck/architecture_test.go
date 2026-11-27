@@ -47,6 +47,13 @@ var accountsCryptoStdlib = []string{
 	"crypto/rand", "crypto/sha256", "crypto/subtle",
 }
 
+var localdiskTinkPackages = []string{
+	"github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset",
+	"github.com/tink-crypto/tink-go/v2/keyset",
+	"github.com/tink-crypto/tink-go/v2/streamingaead",
+	"github.com/tink-crypto/tink-go/v2/tink",
+}
+
 func packageLayer(modulePath, importPath string) layer {
 	relative, local := strings.CutPrefix(importPath, modulePath+"/")
 	if !local {
@@ -91,6 +98,9 @@ func dependencyViolation(modulePath, importer, imported string, standard bool) s
 			return ""
 		}
 		if importer == modulePath+"/internal/accounts" && imported == "golang.org/x/crypto/argon2" {
+			return ""
+		}
+		if importer == modulePath+"/internal/store/localdisk" && slices.Contains(localdiskTinkPackages, imported) {
 			return ""
 		}
 		return "external dependencies are forbidden"
@@ -244,7 +254,16 @@ func TestDependencyRules(t *testing.T) {
 		{sqlite, "github.com/other/pkg", false, true},
 		{sqlite, "golang.org/x/crypto/argon2", false, true},
 		{disk, "os", true, false},
+		{disk, "github.com/tink-crypto/tink-go/v2/streamingaead", false, false},
+		{disk, "github.com/tink-crypto/tink-go/v2/keyset", false, false},
+		{disk, "github.com/tink-crypto/tink-go/v2/insecurecleartextkeyset", false, false},
+		{disk, "github.com/tink-crypto/tink-go/v2/tink", false, false},
+		{disk, "github.com/tink-crypto/tink-go/v2/aead", false, true},
 		{disk, "modernc.org/sqlite", false, true},
+		{files, "github.com/tink-crypto/tink-go/v2/streamingaead", false, true},
+		{api, "github.com/tink-crypto/tink-go/v2/streamingaead", false, true},
+		{sqlite, "github.com/tink-crypto/tink-go/v2/streamingaead", false, true},
+		{entry, "github.com/tink-crypto/tink-go/v2/streamingaead", false, true},
 		{api, "modernc.org/sqlite", false, true},
 		{api, "golang.org/x/crypto/argon2", false, true},
 		{api, "crypto/rand", true, true},

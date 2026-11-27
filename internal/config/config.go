@@ -16,10 +16,11 @@ const (
 )
 
 type Config struct {
-	Addr        string
-	DataDir     string
-	TLSCertFile string
-	TLSKeyFile  string
+	Addr              string
+	DataDir           string
+	TLSCertFile       string
+	TLSKeyFile        string
+	EncryptionKeyFile string
 }
 
 // TLSEnabled reports whether TLS certificate and key paths are configured.
@@ -96,10 +97,50 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("TLS is required when listening on non-loopback address %q: set FILEDOCK_TLS_CERT_FILE and FILEDOCK_TLS_KEY_FILE", addr)
 	}
 
+	encKeyFile := strings.TrimSpace(os.Getenv("FILEDOCK_ENCRYPTION_KEY_FILE"))
+	cleanDataDir := filepath.Clean(dataDir)
+	if encKeyFile != "" {
+		cleanKeyFile := filepath.Clean(encKeyFile)
+		if inside, err := isPathInsideDir(cleanDataDir, cleanKeyFile); err != nil {
+			return Config{}, fmt.Errorf("validate FILEDOCK_ENCRYPTION_KEY_FILE: %w", err)
+		} else if inside {
+			return Config{}, fmt.Errorf("invalid FILEDOCK_ENCRYPTION_KEY_FILE %q: key file must be stored outside FILEDOCK_DATA_DIR %q", encKeyFile, cleanDataDir)
+		}
+		encKeyFile = cleanKeyFile
+	}
+
 	return Config{
-		Addr:        addr,
-		DataDir:     filepath.Clean(dataDir),
-		TLSCertFile: certFile,
-		TLSKeyFile:  keyFile,
+		Addr:              addr,
+		DataDir:           cleanDataDir,
+		TLSCertFile:       certFile,
+		TLSKeyFile:        keyFile,
+		EncryptionKeyFile: encKeyFile,
 	}, nil
+}
+
+func isPathInsideDir(dir, target string) (bool, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return false, err
+	}
+	if resolvedDir, err := filepath.EvalSymlinks(absDir); err == nil {
+		absDir = resolvedDir
+	}
+	if resolvedTarget, err := filepath.EvalSymlinks(absTarget); err == nil {
+		absTarget = resolvedTarget
+	} else if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absTarget)); err == nil {
+		absTarget = filepath.Join(resolvedParent, filepath.Base(absTarget))
+	}
+	rel, err := filepath.Rel(absDir, absTarget)
+	if err != nil {
+		return false, err
+	}
+	if rel == "." {
+		return true, nil
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
 }

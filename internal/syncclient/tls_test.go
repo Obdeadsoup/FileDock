@@ -1,6 +1,7 @@
 package syncclient_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,12 +11,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,26 +39,40 @@ func TestBearerTransportAndRedirectSecurity(t *testing.T) {
 		}
 	}
 
-	// 2. Redirect to a different origin must NOT forward Authorization header.
+	// 2. Cross-origin redirects (302, 307, 308) must be rejected without forwarding token OR body!
+	var targetHits atomic.Int32
 	var receivedAuth string
+	var receivedBody []byte
 	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
 		receivedAuth = r.Header.Get("Authorization")
-		w.WriteHeader(http.StatusUnauthorized)
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer targetSrv.Close()
 
-	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, targetSrv.URL+"/api/v1/auth/me", http.StatusFound)
-	}))
-	defer redirectSrv.Close()
-
-	api, err := syncclient.NewHTTPAPI(redirectSrv.URL, "top-secret-token", nil)
-	if err != nil {
-		t.Fatal(err)
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, targetSrv.URL+r.URL.Path, status)
+		}))
+		api, err := syncclient.NewHTTPAPI(redirectSrv.URL, "top-secret-token", nil)
+		if err != nil {
+			redirectSrv.Close()
+			t.Fatal(err)
+		}
+		if status == http.StatusFound {
+			_, err = api.Me(context.Background())
+		} else {
+			secretBody := []byte("confidential-upload-body")
+			_, _, err = api.ReplaceFileContent(context.Background(), "file-1", `"rev-1"`, bytes.NewReader(secretBody), int64(len(secretBody)))
+		}
+		redirectSrv.Close()
+		if !errors.Is(err, syncclient.ErrCrossOriginRedirect) {
+			t.Fatalf("status %d cross-origin redirect error = %v, want ErrCrossOriginRedirect", status, err)
+		}
 	}
-	_, _ = api.Me(context.Background())
-	if receivedAuth != "" {
-		t.Fatalf("Authorization header was leaked across origins on redirect: %q", receivedAuth)
+	if targetHits.Load() != 0 || receivedAuth != "" || len(receivedBody) != 0 {
+		t.Fatalf("cross-origin target received hits=%d auth=%q body=%q, want 0/empty", targetHits.Load(), receivedAuth, string(receivedBody))
 	}
 
 	// 3. Redirect to non-loopback HTTP must be blocked.

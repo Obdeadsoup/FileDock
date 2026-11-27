@@ -80,6 +80,33 @@ func TestLoadRequiresTLSForNonLoopback(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsEncryptionKeyInsideDataDir(t *testing.T) {
+	unsetEnvForTest(t, "FILEDOCK_TLS_CERT_FILE")
+	unsetEnvForTest(t, "FILEDOCK_TLS_KEY_FILE")
+	t.Setenv("FILEDOCK_ADDR", "127.0.0.1:8080")
+
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "data")
+	t.Setenv("FILEDOCK_DATA_DIR", dataDir)
+
+	// Key inside dataDir must be rejected.
+	t.Setenv("FILEDOCK_ENCRYPTION_KEY_FILE", filepath.Join(dataDir, "master.keyset.json"))
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() expected error when FILEDOCK_ENCRYPTION_KEY_FILE is inside FILEDOCK_DATA_DIR")
+	}
+
+	// Key outside dataDir is accepted.
+	outsideKey := filepath.Join(base, "secrets", "master.keyset.json")
+	t.Setenv("FILEDOCK_ENCRYPTION_KEY_FILE", outsideKey)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with outside key error = %v", err)
+	}
+	if cfg.EncryptionKeyFile != outsideKey {
+		t.Errorf("EncryptionKeyFile = %q, want %q", cfg.EncryptionKeyFile, outsideKey)
+	}
+}
+
 func unsetEnvForTest(t *testing.T, key string) {
 	t.Helper()
 	t.Setenv(key, "")

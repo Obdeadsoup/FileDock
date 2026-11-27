@@ -32,6 +32,7 @@ var (
 	ErrServerConflict       = errors.New("conflict on server (HTTP 409)")
 	ErrSessionExpired       = errors.New("upload session expired on server (HTTP 410)")
 	ErrInsecureTransport    = errors.New("bearer token requests require HTTPS or loopback HTTP")
+	ErrCrossOriginRedirect  = errors.New("refusing cross-origin redirect for bearer-authenticated request")
 )
 
 // UploadSessionInfo represents upload session progress returned by /api/v1/uploads.
@@ -200,7 +201,7 @@ func bearerSafeCheckRedirect(next func(*http.Request, []*http.Request) error) fu
 			return fmt.Errorf("redirect blocked: %w", err)
 		}
 		if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
-			req.Header.Del("Authorization")
+			return fmt.Errorf("%w: %s -> %s", ErrCrossOriginRedirect, via[0].URL.Host, req.URL.Host)
 		}
 		if next != nil {
 			return next(req, via)
