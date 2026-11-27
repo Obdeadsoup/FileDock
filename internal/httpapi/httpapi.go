@@ -481,13 +481,13 @@ func streamContentResponse(w http.ResponseWriter, r *http.Request, file files.Fi
 	w.Header().Set("Content-Disposition", formatAttachmentDisposition(file.Name))
 	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
 	w.Header().Set("ETag", files.ContentETag(file))
+	w.Header().Set("X-FileDock-SHA256", file.SHA256)
 	if includeVersionHeaders {
 		rev := file.ContentRevision
 		if rev <= 0 {
 			rev = 1
 		}
 		w.Header().Set("X-FileDock-Content-Revision", strconv.FormatInt(rev, 10))
-		w.Header().Set("X-FileDock-SHA256", file.SHA256)
 	}
 	w.WriteHeader(http.StatusOK)
 

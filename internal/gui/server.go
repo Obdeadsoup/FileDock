@@ -14,7 +14,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"example.com/filedock/internal/syncclient"
 )
 
 //go:embed web/*
@@ -34,19 +37,28 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
-// Server serves the embedded dual-pane UI on 127.0.0.1 and brokers local/remote file actions.
-type Server struct {
-	cfg           Config
-	localDir      string
-	remote        *remoteClient
-	jobs          *jobManager
-	sessionSecret string
-	csrfToken     string
-	boundHostPort string
-	mux           *http.ServeMux
+type guiSession struct {
+	id        string
+	csrfToken string
+	remote    *remoteClient
 }
 
-// NewServer validates configuration, initializes confined local access and the remote HTTP client.
+// Server serves the embedded dual-pane UI on 127.0.0.1 and brokers local/remote file actions.
+// Each browser session receives an isolated local session ID, CSRF token, and remote auth state.
+type Server struct {
+	cfg           Config
+	serverURL     string
+	localDir      string
+	httpClient    *http.Client
+	jobs          *jobManager
+	boundHostPort string
+	mux           *http.ServeMux
+
+	sessionsMu sync.RWMutex
+	sessions   map[string]*guiSession
+}
+
+// NewServer validates configuration, initializes confined local access and shared TLS HTTP client.
 func NewServer(cfg Config) (*Server, error) {
 	if strings.TrimSpace(cfg.LocalDir) == "" {
 		return nil, errors.New("--local-dir is required")
@@ -76,19 +88,26 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	cfg.ListenAddr = listenAddr
 
-	remote, err := newRemoteClient(cfg.ServerURL, cfg.CACertFile, cfg.HTTPClient)
+	normalizedServer, err := syncclient.NormalizeServerURL(cfg.ServerURL)
 	if err != nil {
 		return nil, err
 	}
+	hc := cfg.HTTPClient
+	if hc == nil {
+		hc, err = syncclient.NewHTTPClient(cfg.CACertFile)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	s := &Server{
-		cfg:           cfg,
-		localDir:      absLocal,
-		remote:        remote,
-		jobs:          newJobManager(),
-		sessionSecret: randomHex(32),
-		csrfToken:     randomHex(32),
-		mux:           http.NewServeMux(),
+		cfg:        cfg,
+		serverURL:  normalizedServer,
+		localDir:   absLocal,
+		httpClient: hc,
+		jobs:       newJobManager(),
+		mux:        http.NewServeMux(),
+		sessions:   make(map[string]*guiSession),
 	}
 	s.registerRoutes()
 	return s, nil
@@ -108,7 +127,7 @@ func (s *Server) Serve(ctx context.Context, stdout io.Writer) error {
 	s.boundHostPort = ln.Addr().String()
 	accessURL := "http://" + s.boundHostPort
 	if stdout != nil {
-		_, _ = fmt.Fprintf(stdout, "FileDock GUI listening at %s (server=%s local_dir=%s)\n", accessURL, s.remote.baseURL, s.localDir)
+		_, _ = fmt.Fprintf(stdout, "FileDock GUI listening at %s (server=%s local_dir=%s)\n", accessURL, s.serverURL, s.localDir)
 	}
 
 	httpSrv := &http.Server{
@@ -134,12 +153,47 @@ func (s *Server) Serve(ctx context.Context, stdout io.Writer) error {
 	return nil
 }
 
+func (s *Server) getOrCreateSession(r *http.Request) (*guiSession, bool, error) {
+	if cookie, err := r.Cookie(guiSessionCookieName); err == nil && cookie.Value != "" {
+		s.sessionsMu.RLock()
+		existing, ok := s.sessions[cookie.Value]
+		s.sessionsMu.RUnlock()
+		if ok {
+			return existing, false, nil
+		}
+	}
+
+	remote, err := newRemoteClient(s.serverURL, s.cfg.CACertFile, s.httpClient)
+	if err != nil {
+		return nil, false, err
+	}
+	sess := &guiSession{
+		id:        randomHex(32),
+		csrfToken: randomHex(32),
+		remote:    remote,
+	}
+	s.sessionsMu.Lock()
+	s.sessions[sess.id] = sess
+	s.sessionsMu.Unlock()
+	return sess, true, nil
+}
+
+func (s *Server) lookupSession(r *http.Request) *guiSession {
+	cookie, err := r.Cookie(guiSessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return nil
+	}
+	s.sessionsMu.RLock()
+	sess := s.sessions[cookie.Value]
+	s.sessionsMu.RUnlock()
+	return sess
+}
+
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /", s.serveIndex)
 	s.mux.HandleFunc("GET /style.css", s.serveStatic("web/style.css", "text/css; charset=utf-8"))
 	s.mux.HandleFunc("GET /app.js", s.serveStatic("web/app.js", "application/javascript; charset=utf-8"))
 
-	// Protected local GUI API routes (require HttpOnly GUI session cookie + CSRF header + same-origin check).
 	s.mux.Handle("GET /api/gui/status", s.protect(s.handleStatus))
 	s.mux.Handle("POST /api/gui/auth/register", s.protect(s.handleRegister))
 	s.mux.Handle("POST /api/gui/auth/login", s.protect(s.handleLogin))
@@ -183,14 +237,21 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing embedded index.html", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     guiSessionCookieName,
-		Value:    s.sessionSecret,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
-	html := strings.Replace(string(raw), "__GUI_CSRF_TOKEN__", s.csrfToken, 1)
+	sess, isNew, err := s.getOrCreateSession(r)
+	if err != nil {
+		http.Error(w, "failed to initialize GUI session", http.StatusInternalServerError)
+		return
+	}
+	if isNew {
+		http.SetCookie(w, &http.Cookie{
+			Name:     guiSessionCookieName,
+			Value:    sess.id,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+	}
+	html := strings.Replace(string(raw), "__GUI_CSRF_TOKEN__", sess.csrfToken, 1)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = io.WriteString(w, html)
@@ -209,69 +270,69 @@ func (s *Server) serveStatic(embedPath, contentType string) http.HandlerFunc {
 	}
 }
 
-func (s *Server) protect(next http.HandlerFunc) http.Handler {
+type sessionHandlerFunc func(w http.ResponseWriter, r *http.Request, sess *guiSession)
+
+func (s *Server) protect(next sessionHandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.verifyOriginAndSession(r) {
+		sess := s.verifyOriginAndSession(r)
+		if sess == nil {
 			writeGUIError(w, http.StatusForbidden, "forbidden: invalid local GUI session or cross-origin request")
 			return
 		}
-		next(w, r)
+		next(w, r, sess)
 	})
 }
 
-func (s *Server) verifyOriginAndSession(r *http.Request) bool {
-	// 1. Validate Host is loopback (and matches boundHostPort when bound).
+func (s *Server) verifyOriginAndSession(r *http.Request) *guiSession {
 	hostOnly := r.Host
 	if h, _, err := net.SplitHostPort(r.Host); err == nil {
 		hostOnly = h
 	}
 	if !isLoopbackHost(hostOnly) {
-		return false
+		return nil
 	}
 	if s.boundHostPort != "" && !strings.EqualFold(r.Host, s.boundHostPort) {
 		_, boundPort, _ := net.SplitHostPort(s.boundHostPort)
 		_, reqPort, _ := net.SplitHostPort(r.Host)
 		if reqPort != boundPort {
-			return false
+			return nil
 		}
 	}
 
-	// 2. Validate Origin and Sec-Fetch-Site when present.
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
 		u, err := url.Parse(origin)
 		if err != nil || !strings.EqualFold(u.Scheme, "http") || !strings.EqualFold(u.Host, r.Host) {
-			return false
+			return nil
 		}
 	}
 	if fetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); fetchSite != "" {
 		if fetchSite != "same-origin" && fetchSite != "none" {
-			return false
+			return nil
 		}
 	}
 
-	// 3. Validate HttpOnly GUI session cookie + CSRF header token.
-	cookie, err := r.Cookie(guiSessionCookieName)
-	if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(s.sessionSecret)) != 1 {
-		return false
+	sess := s.lookupSession(r)
+	if sess == nil {
+		return nil
 	}
 	csrf := strings.TrimSpace(r.Header.Get(guiCSRFHeaderName))
-	if subtle.ConstantTimeCompare([]byte(csrf), []byte(s.csrfToken)) != 1 {
-		return false
+	if subtle.ConstantTimeCompare([]byte(csrf), []byte(sess.csrfToken)) != 1 {
+		return nil
 	}
-	return true
+	return sess
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	_, user := s.remote.currentAuth()
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, sess *guiSession) {
+	_, user := sess.remote.currentAuth()
 	writeGUIJSON(w, http.StatusOK, map[string]any{
-		"server_url": s.remote.baseURL,
+		"server_url": s.serverURL,
 		"local_dir":  s.localDir,
 		"logged_in":  user != nil,
 		"user":       user,
 	})
 }
 
-func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -279,7 +340,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	user, err := s.remote.Register(r.Context(), req.Username, req.Password)
+	user, err := sess.remote.Register(r.Context(), req.Username, req.Password)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -288,7 +349,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusCreated, user)
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -296,18 +357,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	user, err := s.remote.Login(r.Context(), req.Username, req.Password)
+	// Cancel any prior remote user's jobs in this browser session before switching identity.
+	if _, prevUser := sess.remote.currentAuth(); prevUser != nil {
+		s.jobs.cancelAndCleanForOwner(sess.id, prevUser.ID)
+	}
+	user, err := sess.remote.Login(r.Context(), req.Username, req.Password)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
-	// Never return the Bearer token to the browser; return only public user info.
 	writeGUIJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if err := s.remote.Logout(r.Context()); err != nil {
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	loggedOutUserID, err := sess.remote.Logout(r.Context())
+	s.jobs.cancelAndCleanForOwner(sess.id, loggedOutUserID)
+	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
@@ -315,7 +381,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleLocalList(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLocalList(w http.ResponseWriter, r *http.Request, _ *guiSession) {
 	entries, cleaned, err := listLocalDir(s.localDir, r.URL.Query().Get("path"))
 	if err != nil {
 		code, msg := formatStatusCode(err)
@@ -328,7 +394,7 @@ func (s *Server) handleLocalList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleLocalMkdir(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLocalMkdir(w http.ResponseWriter, r *http.Request, _ *guiSession) {
 	var req struct {
 		Parent string `json:"parent"`
 		Name   string `json:"name"`
@@ -345,7 +411,7 @@ func (s *Server) handleLocalMkdir(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusCreated, map[string]string{"path": created})
 }
 
-func (s *Server) handleLocalRename(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLocalRename(w http.ResponseWriter, r *http.Request, _ *guiSession) {
 	var req struct {
 		Path    string `json:"path"`
 		DstDir  string `json:"dst_dir"`
@@ -363,7 +429,7 @@ func (s *Server) handleLocalRename(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, map[string]string{"path": dst})
 }
 
-func (s *Server) handleLocalDelete(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLocalDelete(w http.ResponseWriter, r *http.Request, _ *guiSession) {
 	var req struct {
 		Path string `json:"path"`
 	}
@@ -378,45 +444,63 @@ func (s *Server) handleLocalDelete(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (s *Server) handleRemoteList(w http.ResponseWriter, r *http.Request) {
-	parentID := strings.TrimSpace(r.URL.Query().Get("parent_id"))
-	folders, err := s.remote.ListFolders(r.Context(), parentID)
+func (s *Server) handleRemoteList(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	q := r.URL.Query()
+	parentID := strings.TrimSpace(q.Get("parent_id"))
+	folderLimit := parseQueryInt(q, "folder_limit", defaultGUIPageSize)
+	folderOffset := parseQueryInt(q, "folder_offset", 0)
+	fileLimit := parseQueryInt(q, "file_limit", defaultGUIPageSize)
+	fileOffset := parseQueryInt(q, "file_offset", 0)
+
+	folders, foldersMore, foldersNext, err := sess.remote.ListFolders(r.Context(), parentID, folderLimit, folderOffset)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
-	filesList, err := s.remote.ListFiles(r.Context(), parentID)
+	filesList, filesMore, filesNext, err := sess.remote.ListFiles(r.Context(), parentID, fileLimit, fileOffset)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
 	writeGUIJSON(w, http.StatusOK, map[string]any{
-		"parent_id": parentID,
-		"folders":   folders,
-		"files":     filesList,
+		"parent_id":           parentID,
+		"folders":             folders,
+		"folders_has_more":    foldersMore,
+		"folders_next_offset": foldersNext,
+		"files":               filesList,
+		"files_has_more":      filesMore,
+		"files_next_offset":   filesNext,
 	})
 }
 
-func (s *Server) handleRemoteSearch(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteSearch(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	q := r.URL.Query()
-	items, err := s.remote.SearchFiles(
+	limit := parseQueryInt(q, "limit", defaultGUIPageSize)
+	offset := parseQueryInt(q, "offset", 0)
+	items, hasMore, nextOffset, err := sess.remote.SearchFiles(
 		r.Context(),
 		q.Get("q"),
 		parseOptionalIntParam(q.Get("min_size")),
 		parseOptionalIntParam(q.Get("max_size")),
 		strings.TrimSpace(q.Get("parent_id")),
+		limit,
+		offset,
 	)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
-	writeGUIJSON(w, http.StatusOK, map[string]any{"files": items})
+	writeGUIJSON(w, http.StatusOK, map[string]any{
+		"files":       items,
+		"has_more":    hasMore,
+		"next_offset": nextOffset,
+	})
 }
 
-func (s *Server) handleRemoteCreateFolder(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteCreateFolder(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		Name     string  `json:"name"`
 		ParentID *string `json:"parent_id"`
@@ -424,7 +508,7 @@ func (s *Server) handleRemoteCreateFolder(w http.ResponseWriter, r *http.Request
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	folder, err := s.remote.CreateFolder(r.Context(), req.ParentID, req.Name)
+	folder, err := sess.remote.CreateFolder(r.Context(), req.ParentID, req.Name)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -433,12 +517,12 @@ func (s *Server) handleRemoteCreateFolder(w http.ResponseWriter, r *http.Request
 	writeGUIJSON(w, http.StatusCreated, folder)
 }
 
-func (s *Server) handleRemoteUpdateFolder(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteUpdateFolder(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req map[string]any
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	folder, err := s.remote.UpdateFolder(r.Context(), r.PathValue("id"), req)
+	folder, err := sess.remote.UpdateFolder(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -447,8 +531,8 @@ func (s *Server) handleRemoteUpdateFolder(w http.ResponseWriter, r *http.Request
 	writeGUIJSON(w, http.StatusOK, folder)
 }
 
-func (s *Server) handleRemoteDeleteFolder(w http.ResponseWriter, r *http.Request) {
-	if err := s.remote.DeleteFolder(r.Context(), r.PathValue("id")); err != nil {
+func (s *Server) handleRemoteDeleteFolder(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	if err := sess.remote.DeleteFolder(r.Context(), r.PathValue("id")); err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
@@ -456,12 +540,12 @@ func (s *Server) handleRemoteDeleteFolder(w http.ResponseWriter, r *http.Request
 	writeGUIJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (s *Server) handleRemoteUpdateFile(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteUpdateFile(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req map[string]any
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	file, err := s.remote.UpdateFile(r.Context(), r.PathValue("id"), req)
+	file, err := sess.remote.UpdateFile(r.Context(), r.PathValue("id"), req)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -470,8 +554,8 @@ func (s *Server) handleRemoteUpdateFile(w http.ResponseWriter, r *http.Request) 
 	writeGUIJSON(w, http.StatusOK, file)
 }
 
-func (s *Server) handleRemoteDeleteFile(w http.ResponseWriter, r *http.Request) {
-	if err := s.remote.DeleteFile(r.Context(), r.PathValue("id")); err != nil {
+func (s *Server) handleRemoteDeleteFile(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	if err := sess.remote.DeleteFile(r.Context(), r.PathValue("id")); err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
@@ -479,8 +563,8 @@ func (s *Server) handleRemoteDeleteFile(w http.ResponseWriter, r *http.Request) 
 	writeGUIJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (s *Server) handleRemoteHeadFile(w http.ResponseWriter, r *http.Request) {
-	info, err := s.remote.HeadFile(r.Context(), r.PathValue("id"))
+func (s *Server) handleRemoteHeadFile(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	info, err := sess.remote.HeadFile(r.Context(), r.PathValue("id"))
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -494,21 +578,28 @@ func (s *Server) handleRemoteHeadFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleRemoteListShares(w http.ResponseWriter, r *http.Request) {
-	dir := strings.TrimSpace(r.URL.Query().Get("direction"))
+func (s *Server) handleRemoteListShares(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	q := r.URL.Query()
+	dir := strings.TrimSpace(q.Get("direction"))
 	if dir == "" {
 		dir = "received"
 	}
-	items, err := s.remote.ListShares(r.Context(), dir)
+	limit := parseQueryInt(q, "limit", defaultGUIPageSize)
+	offset := parseQueryInt(q, "offset", 0)
+	items, hasMore, nextOffset, err := sess.remote.ListShares(r.Context(), dir, limit, offset)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
-	writeGUIJSON(w, http.StatusOK, map[string]any{"shares": items})
+	writeGUIJSON(w, http.StatusOK, map[string]any{
+		"shares":      items,
+		"has_more":    hasMore,
+		"next_offset": nextOffset,
+	})
 }
 
-func (s *Server) handleRemoteCreateShare(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteCreateShare(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		ResourceType      string `json:"resource_type"`
 		ResourceID        string `json:"resource_id"`
@@ -517,7 +608,7 @@ func (s *Server) handleRemoteCreateShare(w http.ResponseWriter, r *http.Request)
 	if !decodeGUIJSON(w, r, &req) {
 		return
 	}
-	sh, err := s.remote.CreateShare(r.Context(), req.ResourceType, req.ResourceID, req.RecipientUsername)
+	sh, err := sess.remote.CreateShare(r.Context(), req.ResourceType, req.ResourceID, req.RecipientUsername)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -526,8 +617,8 @@ func (s *Server) handleRemoteCreateShare(w http.ResponseWriter, r *http.Request)
 	writeGUIJSON(w, http.StatusCreated, sh)
 }
 
-func (s *Server) handleRemoteDeleteShare(w http.ResponseWriter, r *http.Request) {
-	if err := s.remote.DeleteShare(r.Context(), r.PathValue("id")); err != nil {
+func (s *Server) handleRemoteDeleteShare(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	if err := sess.remote.DeleteShare(r.Context(), r.PathValue("id")); err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
@@ -535,15 +626,24 @@ func (s *Server) handleRemoteDeleteShare(w http.ResponseWriter, r *http.Request)
 	writeGUIJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
-func (s *Server) handleRemoteBrowseShare(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRemoteBrowseShare(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	q := r.URL.Query()
 	shareID := r.PathValue("id")
-	parentID := strings.TrimSpace(r.URL.Query().Get("parent_id"))
-	resourceType := strings.TrimSpace(r.URL.Query().Get("resource_type"))
+	parentID := strings.TrimSpace(q.Get("parent_id"))
+	resourceType := strings.TrimSpace(q.Get("resource_type"))
+	folderLimit := parseQueryInt(q, "folder_limit", defaultGUIPageSize)
+	folderOffset := parseQueryInt(q, "folder_offset", 0)
+	fileLimit := parseQueryInt(q, "file_limit", defaultGUIPageSize)
+	fileOffset := parseQueryInt(q, "file_offset", 0)
 
-	var folders []RemoteFolder
+	var (
+		folders     []RemoteFolder
+		foldersMore bool
+		foldersNext int
+	)
 	if resourceType != "file" {
 		var err error
-		folders, err = s.remote.ListSharedFolders(r.Context(), shareID, parentID)
+		folders, foldersMore, foldersNext, err = sess.remote.ListSharedFolders(r.Context(), shareID, parentID, folderLimit, folderOffset)
 		if err != nil {
 			code, msg := formatStatusCode(err)
 			writeGUIError(w, code, msg)
@@ -552,21 +652,25 @@ func (s *Server) handleRemoteBrowseShare(w http.ResponseWriter, r *http.Request)
 	} else {
 		folders = []RemoteFolder{}
 	}
-	filesList, err := s.remote.ListSharedFiles(r.Context(), shareID, parentID)
+	filesList, filesMore, filesNext, err := sess.remote.ListSharedFiles(r.Context(), shareID, parentID, fileLimit, fileOffset)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
 		return
 	}
 	writeGUIJSON(w, http.StatusOK, map[string]any{
-		"share_id":  shareID,
-		"parent_id": parentID,
-		"folders":   folders,
-		"files":     filesList,
+		"share_id":            shareID,
+		"parent_id":           parentID,
+		"folders":             folders,
+		"folders_has_more":    foldersMore,
+		"folders_next_offset": foldersNext,
+		"files":               filesList,
+		"files_has_more":      filesMore,
+		"files_next_offset":   filesNext,
 	})
 }
 
-func (s *Server) handleUploadSimple(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUploadSimple(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		LocalPath string  `json:"local_path"`
 		ParentID  *string `json:"parent_id"`
@@ -582,7 +686,7 @@ func (s *Server) handleUploadSimple(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	uploaded, err := s.remote.UploadSimple(r.Context(), req.ParentID, filepath.Base(cleaned), f)
+	uploaded, err := sess.remote.UploadSimple(r.Context(), req.ParentID, baseRelName(cleaned), f)
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -591,7 +695,7 @@ func (s *Server) handleUploadSimple(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusCreated, uploaded)
 }
 
-func (s *Server) handleReplaceContent(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleReplaceContent(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		LocalPath string `json:"local_path"`
 		FileID    string `json:"file_id"`
@@ -608,7 +712,7 @@ func (s *Server) handleReplaceContent(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	updated, etag, err := s.remote.ReplaceFileContent(r.Context(), req.FileID, req.IfMatch, f, info.Size())
+	updated, etag, err := sess.remote.ReplaceFileContent(r.Context(), req.FileID, req.IfMatch, f, info.Size())
 	if err != nil {
 		code, msg := formatStatusCode(err)
 		writeGUIError(w, code, msg)
@@ -620,7 +724,7 @@ func (s *Server) handleReplaceContent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleStartResumableUpload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStartResumableUpload(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		LocalPath       string  `json:"local_path"`
 		ParentID        *string `json:"parent_id"`
@@ -631,8 +735,9 @@ func (s *Server) handleStartResumableUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	snap, err := s.jobs.startResumableUpload(
+		sess.id,
 		s.localDir,
-		s.remote,
+		sess.remote,
 		req.LocalPath,
 		req.ParentID,
 		strings.TrimSpace(req.SessionID),
@@ -646,8 +751,13 @@ func (s *Server) handleStartResumableUpload(w http.ResponseWriter, r *http.Reque
 	writeGUIJSON(w, http.StatusAccepted, snap)
 }
 
-func (s *Server) handleGetUploadJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.jobs.get(r.PathValue("id"))
+func (s *Server) handleGetUploadJob(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	_, user := sess.remote.currentAuth()
+	if user == nil {
+		writeGUIError(w, http.StatusUnauthorized, ErrRemoteNotLoggedIn.Error())
+		return
+	}
+	job, ok := s.jobs.getForOwner(r.PathValue("id"), sess.id, user.ID)
 	if !ok {
 		writeGUIError(w, http.StatusNotFound, "upload job not found")
 		return
@@ -655,8 +765,13 @@ func (s *Server) handleGetUploadJob(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, job.snapshot())
 }
 
-func (s *Server) handleCancelUploadJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.jobs.get(r.PathValue("id"))
+func (s *Server) handleCancelUploadJob(w http.ResponseWriter, r *http.Request, sess *guiSession) {
+	_, user := sess.remote.currentAuth()
+	if user == nil {
+		writeGUIError(w, http.StatusUnauthorized, ErrRemoteNotLoggedIn.Error())
+		return
+	}
+	job, ok := s.jobs.getForOwner(r.PathValue("id"), sess.id, user.ID)
 	if !ok {
 		writeGUIError(w, http.StatusNotFound, "upload job not found")
 		return
@@ -666,7 +781,7 @@ func (s *Server) handleCancelUploadJob(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, job.snapshot())
 }
 
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		FileID         string `json:"file_id"`
 		FileName       string `json:"file_name"`
@@ -683,9 +798,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		req.FileName,
 		req.ExpectedSHA256,
 		req.ConflictPolicy,
-		func() (io.ReadCloser, error) {
-			return s.remote.OpenFileDownload(r.Context(), req.FileID)
+		func() (downloadStreamResult, error) {
+			return sess.remote.OpenFileDownload(r.Context(), req.FileID)
 		},
+		nil,
 	)
 	if conflict != nil {
 		writeGUIJSON(w, http.StatusConflict, map[string]any{
@@ -704,7 +820,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	writeGUIJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) handleDownloadShared(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDownloadShared(w http.ResponseWriter, r *http.Request, sess *guiSession) {
 	var req struct {
 		ShareID        string `json:"share_id"`
 		FileID         string `json:"file_id"`
@@ -722,9 +838,10 @@ func (s *Server) handleDownloadShared(w http.ResponseWriter, r *http.Request) {
 		req.FileName,
 		req.ExpectedSHA256,
 		req.ConflictPolicy,
-		func() (io.ReadCloser, error) {
-			return s.remote.OpenSharedFileDownload(r.Context(), req.ShareID, req.FileID)
+		func() (downloadStreamResult, error) {
+			return sess.remote.OpenSharedFileDownload(r.Context(), req.ShareID, req.FileID)
 		},
+		nil,
 	)
 	if conflict != nil {
 		writeGUIJSON(w, http.StatusConflict, map[string]any{

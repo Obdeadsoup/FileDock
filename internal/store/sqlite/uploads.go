@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
 	expires_at TEXT NOT NULL,
 	expires_at_ns INTEGER NOT NULL,
 	completed_at TEXT,
-	completed_at_ns INTEGER
+	completed_at_ns INTEGER,
+	chunks_cleaned INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_upload_sessions_owner_status
@@ -61,6 +62,20 @@ func migrateUploadSessions(ctx context.Context, tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `ALTER TABLE upload_chunks ADD COLUMN storage_key TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("add storage_key column to upload_chunks: %w", err)
 		}
+	}
+	hasChunksCleaned, err := tableHasColumn(ctx, tx, "upload_sessions", "chunks_cleaned")
+	if err != nil {
+		return err
+	}
+	if !hasChunksCleaned {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE upload_sessions ADD COLUMN chunks_cleaned INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add chunks_cleaned column to upload_sessions: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_uncleaned
+	ON upload_sessions (status, chunks_cleaned, completed_at_ns ASC, id ASC)`); err != nil {
+		return fmt.Errorf("create upload_sessions uncleaned index: %w", err)
 	}
 	return nil
 }
@@ -327,7 +342,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if _, err := tx.ExecContext(
 		ctx,
 		`UPDATE upload_sessions
-		 SET status = ?, file_id = ?, completed_at = ?, completed_at_ns = ?
+		 SET status = ?, file_id = ?, completed_at = ?, completed_at_ns = ?, chunks_cleaned = 0
 		 WHERE id = ? AND owner_id = ?`,
 		files.UploadStatusCompleted,
 		file.ID,
@@ -390,6 +405,52 @@ func (s *Store) DeleteExpiredUploadSession(ctx context.Context, sessionID string
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("delete expired upload session: %w", err)
+	}
+	return nil
+}
+
+// ListUncleanedCompletedUploadSessions returns up to limit IDs of completed upload sessions
+// whose staged chunk directory has not yet been confirmed cleaned.
+func (s *Store) ListUncleanedCompletedUploadSessions(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = files.DefaultUploadCleanupBatchSize
+	}
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id FROM upload_sessions
+		 WHERE status = 'completed' AND chunks_cleaned = 0
+		 ORDER BY completed_at_ns ASC, id ASC
+		 LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list uncleaned completed upload sessions: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan uncleaned completed upload session id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate uncleaned completed upload sessions: %w", err)
+	}
+	return ids, nil
+}
+
+// MarkUploadChunksCleaned marks a completed upload session's staged chunks as cleaned while keeping
+// the completed session row in SQLite for idempotent CompleteUploadSession retries.
+func (s *Store) MarkUploadChunksCleaned(ctx context.Context, sessionID string) error {
+	if _, err := s.db.ExecContext(
+		ctx,
+		`UPDATE upload_sessions SET chunks_cleaned = 1 WHERE id = ? AND status = 'completed'`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf("mark upload chunks cleaned: %w", err)
 	}
 	return nil
 }

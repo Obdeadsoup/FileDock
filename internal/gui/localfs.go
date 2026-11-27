@@ -48,36 +48,44 @@ type LocalDownloadResult struct {
 	SHA256    string `json:"sha256"`
 }
 
+// normalizeLocalRelPath validates a relative path inside --local-dir WITHOUT stripping
+// leading or trailing spaces from directory/file names, while rejecting absolute paths,
+// parent traversal, NUL bytes, and protected .filedock metadata.
 func normalizeLocalRelPath(raw string, allowRoot bool) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || trimmed == "." || trimmed == "/" {
+	if raw == "" || raw == "." || raw == "/" {
 		if allowRoot {
 			return "", nil
 		}
 		return "", fmt.Errorf("%w: path is required", ErrLocalPathForbidden)
 	}
-	if filepath.IsAbs(trimmed) || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, `\`) {
+	if filepath.IsAbs(raw) || strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, `\`) {
 		return "", fmt.Errorf("%w: absolute path is not allowed", ErrLocalPathForbidden)
 	}
-	if strings.Contains(trimmed, "\x00") {
+	if strings.Contains(raw, "\x00") {
 		return "", fmt.Errorf("%w: NUL byte not allowed", ErrLocalPathForbidden)
 	}
-	slashed := strings.ReplaceAll(trimmed, `\`, "/")
-	for _, seg := range strings.Split(slashed, "/") {
-		if seg == ".." {
-			return "", fmt.Errorf("%w: parent traversal is not allowed", ErrLocalPathForbidden)
-		}
-	}
-	cleaned := path.Clean(slashed)
-	if cleaned == "." {
+
+	// Trim only trailing slash(es) if any, never spaces.
+	trimmedSlash := strings.TrimRight(raw, "/")
+	if trimmedSlash == "" {
 		if allowRoot {
 			return "", nil
 		}
 		return "", fmt.Errorf("%w: root path not allowed for this operation", ErrLocalPathForbidden)
 	}
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("%w: path escapes local root", ErrLocalPathForbidden)
+
+	rawParts := strings.Split(trimmedSlash, "/")
+	parts := make([]string, 0, len(rawParts))
+	for _, seg := range rawParts {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("%w: invalid path segment %q", ErrLocalPathForbidden, seg)
+		}
+		if os.PathSeparator == '\\' && strings.Contains(seg, `\`) {
+			return "", fmt.Errorf("%w: invalid separator in segment %q", ErrLocalPathForbidden, seg)
+		}
+		parts = append(parts, seg)
 	}
+	cleaned := strings.Join(parts, "/")
 	if isProtectedLocalPath(cleaned) {
 		return "", fmt.Errorf("%w: %s is protected", ErrLocalPathForbidden, reservedMetaDir)
 	}
@@ -119,6 +127,33 @@ func isProtectedLocalPath(rel string) bool {
 		}
 	}
 	return false
+}
+
+func joinRel(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
+}
+
+func baseRelName(rel string) string {
+	if idx := strings.LastIndex(rel, "/"); idx >= 0 {
+		return rel[idx+1:]
+	}
+	return rel
+}
+
+func isValidSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func openLocalRoot(localDir string) (*os.Root, error) {
@@ -179,10 +214,7 @@ func listLocalDir(localDir, relDir string) ([]LocalEntry, string, error) {
 		if err != nil {
 			continue
 		}
-		entryPath := name
-		if cleaned != "" {
-			entryPath = path.Join(cleaned, name)
-		}
+		entryPath := joinRel(cleaned, name)
 		result = append(result, LocalEntry{
 			Name:        name,
 			Path:        entryPath,
@@ -213,10 +245,7 @@ func mkdirLocal(localDir, parentRel, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	target := validName
-	if parent != "" {
-		target = path.Join(parent, validName)
-	}
+	target := joinRel(parent, validName)
 	if isProtectedLocalPath(target) {
 		return "", ErrLocalPathForbidden
 	}
@@ -249,10 +278,7 @@ func renameOrMoveLocal(localDir, srcRel, dstDirRel, newName string) (string, err
 	if err != nil {
 		return "", err
 	}
-	dst := validName
-	if dstDir != "" {
-		dst = path.Join(dstDir, validName)
-	}
+	dst := joinRel(dstDir, validName)
 	if isProtectedLocalPath(dst) {
 		return "", ErrLocalPathForbidden
 	}
@@ -337,9 +363,15 @@ func openLocalRegularFile(localDir, relPath string) (*os.File, os.FileInfo, stri
 	return f, info, cleaned, nil
 }
 
+type downloadStreamResult struct {
+	Body         io.ReadCloser
+	HeaderSHA256 string
+}
+
 func downloadStreamToLocal(
 	localDir, targetDirRel, fileName, expectedSHA256, conflictPolicy string,
-	openStream func() (io.ReadCloser, error),
+	openStream func() (downloadStreamResult, error),
+	beforePublish func(),
 ) (LocalDownloadResult, *LocalDownloadConflict, error) {
 	dirRel, err := normalizeLocalRelPath(targetDirRel, true)
 	if err != nil {
@@ -348,6 +380,17 @@ func downloadStreamToLocal(
 	validName, err := validateSingleEntryName(fileName)
 	if err != nil {
 		return LocalDownloadResult{}, nil, err
+	}
+	if conflictPolicy == "" {
+		conflictPolicy = "ask"
+	}
+	if conflictPolicy != "ask" && conflictPolicy != "rename" && conflictPolicy != "overwrite" {
+		return LocalDownloadResult{}, nil, fmt.Errorf("unknown conflict policy %q", conflictPolicy)
+	}
+
+	trimmedExpected := strings.TrimSpace(expectedSHA256)
+	if trimmedExpected == "" || !isValidSHA256Hex(trimmedExpected) {
+		return LocalDownloadResult{}, nil, fmt.Errorf("%w: expected_sha256 is required for download integrity verification", ErrLocalHashMismatch)
 	}
 
 	root, err := openLocalRoot(localDir)
@@ -364,65 +407,53 @@ func downloadStreamToLocal(
 			}
 			return LocalDownloadResult{}, nil, err
 		}
-		if !info.IsDir() {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return LocalDownloadResult{}, nil, fmt.Errorf("%w: target dir %q is not a directory", ErrLocalPathForbidden, dirRel)
 		}
 	}
 
-	targetPath := validName
-	if dirRel != "" {
-		targetPath = path.Join(dirRel, validName)
-	}
+	targetPath := joinRel(dirRel, validName)
 
-	if _, statErr := root.Lstat(targetPath); statErr == nil {
+	// Fast pre-check before downloading for ask and overwrite-on-directory.
+	if info, statErr := root.Lstat(targetPath); statErr == nil {
 		switch conflictPolicy {
-		case "", "ask":
+		case "ask":
 			suggested := suggestNonCollidingName(root, dirRel, validName)
 			return LocalDownloadResult{}, &LocalDownloadConflict{
 				TargetPath:    targetPath,
 				SuggestedName: suggested,
 			}, ErrLocalConflict
-		case "rename":
-			suggested := suggestNonCollidingName(root, dirRel, validName)
-			if dirRel != "" {
-				targetPath = path.Join(dirRel, suggested)
-			} else {
-				targetPath = suggested
-			}
 		case "overwrite":
-			info, _ := root.Lstat(targetPath)
-			if info != nil && info.IsDir() {
-				return LocalDownloadResult{}, nil, fmt.Errorf("%w: cannot overwrite directory %q", ErrLocalConflict, targetPath)
+			if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return LocalDownloadResult{}, nil, fmt.Errorf("%w: cannot overwrite non-regular entry %q", ErrLocalConflict, targetPath)
 			}
-		default:
-			return LocalDownloadResult{}, nil, fmt.Errorf("unknown conflict policy %q", conflictPolicy)
 		}
 	}
 
-	rc, err := openStream()
+	streamRes, err := openStream()
 	if err != nil {
 		return LocalDownloadResult{}, nil, err
 	}
-	defer rc.Close()
+	defer streamRes.Body.Close()
+
+	if hdrSHA := strings.TrimSpace(streamRes.HeaderSHA256); hdrSHA != "" {
+		if !isValidSHA256Hex(hdrSHA) || !strings.EqualFold(hdrSHA, trimmedExpected) {
+			return LocalDownloadResult{}, nil, fmt.Errorf("%w: server header sha256 %q does not match expected %q", ErrLocalHashMismatch, hdrSHA, trimmedExpected)
+		}
+	}
 
 	tmpName := downloadTempPrefix + randomHex(8) + ".tmp"
-	tmpPath := tmpName
-	if dirRel != "" {
-		tmpPath = path.Join(dirRel, tmpName)
-	}
+	tmpPath := joinRel(dirRel, tmpName)
 	tmpFile, err := root.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 	if err != nil {
 		return LocalDownloadResult{}, nil, fmt.Errorf("create local download temp file: %w", err)
 	}
-	committed := false
 	defer func() {
-		if !committed {
-			_ = root.Remove(tmpPath)
-		}
+		_ = root.Remove(tmpPath)
 	}()
 
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), rc)
+	written, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), streamRes.Body)
 	if copyErr != nil {
 		_ = tmpFile.Close()
 		return LocalDownloadResult{}, nil, fmt.Errorf("stream download: %w", copyErr)
@@ -436,20 +467,93 @@ func downloadStreamToLocal(
 	}
 
 	actualSHA := hex.EncodeToString(hasher.Sum(nil))
-	if expectedSHA256 != "" && !strings.EqualFold(actualSHA, expectedSHA256) {
-		return LocalDownloadResult{}, nil, fmt.Errorf("%w: got %s, expected %s", ErrLocalHashMismatch, actualSHA, expectedSHA256)
+	if !strings.EqualFold(actualSHA, trimmedExpected) {
+		return LocalDownloadResult{}, nil, fmt.Errorf("%w: got %s, expected %s", ErrLocalHashMismatch, actualSHA, trimmedExpected)
 	}
 
-	if err := root.Rename(tmpPath, targetPath); err != nil {
-		return LocalDownloadResult{}, nil, fmt.Errorf("publish downloaded file: %w", err)
+	if beforePublish != nil {
+		beforePublish()
 	}
-	committed = true
+
+	finalPath, conflict, pubErr := publishDownloadedFile(root, tmpPath, dirRel, validName, conflictPolicy)
+	if conflict != nil {
+		return LocalDownloadResult{}, conflict, ErrLocalConflict
+	}
+	if pubErr != nil {
+		return LocalDownloadResult{}, nil, pubErr
+	}
 
 	return LocalDownloadResult{
-		SavedPath: targetPath,
+		SavedPath: finalPath,
 		Size:      written,
 		SHA256:    actualSHA,
 	}, nil, nil
+}
+
+// publishDownloadedFile atomically publishes tmpPath according to conflictPolicy.
+// For "ask" and "rename", it uses os.Root.Link so an existing file that appeared after the
+// pre-check can NEVER be overwritten.
+func publishDownloadedFile(root *os.Root, tmpPath, dirRel, validName, conflictPolicy string) (string, *LocalDownloadConflict, error) {
+	targetPath := joinRel(dirRel, validName)
+	switch conflictPolicy {
+	case "ask":
+		err := root.Link(tmpPath, targetPath)
+		if err != nil {
+			if errors.Is(err, os.ErrExist) {
+				suggested := suggestNonCollidingName(root, dirRel, validName)
+				return "", &LocalDownloadConflict{
+					TargetPath:    targetPath,
+					SuggestedName: suggested,
+				}, ErrLocalConflict
+			}
+			return "", nil, fmt.Errorf("publish downloaded file: %w", err)
+		}
+		return targetPath, nil, nil
+
+	case "rename":
+		// Try the base name first, then numbered suffixes until Link succeeds without overwriting.
+		if err := root.Link(tmpPath, targetPath); err == nil {
+			return targetPath, nil, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", nil, fmt.Errorf("publish downloaded file: %w", err)
+		}
+		ext := path.Ext(validName)
+		stem := strings.TrimSuffix(validName, ext)
+		if ext == validName {
+			stem = validName
+			ext = ""
+		}
+		for i := 1; i < 10000; i++ {
+			candidate := fmt.Sprintf("%s (%d)%s", stem, i, ext)
+			full := joinRel(dirRel, candidate)
+			err := root.Link(tmpPath, full)
+			if err == nil {
+				return full, nil, nil
+			}
+			if !errors.Is(err, os.ErrExist) {
+				return "", nil, fmt.Errorf("publish renamed downloaded file: %w", err)
+			}
+		}
+		fallback := joinRel(dirRel, fmt.Sprintf("%s-%s%s", stem, randomHex(4), ext))
+		if err := root.Link(tmpPath, fallback); err != nil {
+			return "", nil, fmt.Errorf("publish renamed downloaded file: %w", err)
+		}
+		return fallback, nil, nil
+
+	case "overwrite":
+		if info, err := root.Lstat(targetPath); err == nil {
+			if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", nil, fmt.Errorf("%w: cannot overwrite non-regular entry %q", ErrLocalConflict, targetPath)
+			}
+		}
+		if err := root.Rename(tmpPath, targetPath); err != nil {
+			return "", nil, fmt.Errorf("overwrite downloaded file: %w", err)
+		}
+		return targetPath, nil, nil
+
+	default:
+		return "", nil, fmt.Errorf("unknown conflict policy %q", conflictPolicy)
+	}
 }
 
 func suggestNonCollidingName(root *os.Root, dirRel, name string) string {
@@ -461,10 +565,7 @@ func suggestNonCollidingName(root *os.Root, dirRel, name string) string {
 	}
 	for i := 1; i < 10000; i++ {
 		candidate := fmt.Sprintf("%s (%d)%s", stem, i, ext)
-		full := candidate
-		if dirRel != "" {
-			full = path.Join(dirRel, candidate)
-		}
+		full := joinRel(dirRel, candidate)
 		if _, err := root.Lstat(full); errors.Is(err, os.ErrNotExist) {
 			return candidate
 		}

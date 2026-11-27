@@ -12,14 +12,27 @@
     remoteStack: [{ id: '', name: 'Remote Root' }],
     remoteFolders: [],
     remoteFiles: [],
+    remoteFoldersHasMore: false,
+    remoteFoldersNextOffset: 0,
+    remoteFilesHasMore: false,
+    remoteFilesNextOffset: 0,
     remoteSearchActive: false,
+    remoteSearchHasMore: false,
+    remoteSearchNextOffset: 0,
+    remoteSearchParams: null,
     selectedRemote: null, // { kind: 'folder'|'file', item, etag? }
 
     shares: [],
+    sharesHasMore: false,
+    sharesNextOffset: 0,
     activeShare: null, // { id, resource_type, resource_name, owner_username }
     shareStack: [],
     shareFolders: [],
     shareFiles: [],
+    shareFoldersHasMore: false,
+    shareFoldersNextOffset: 0,
+    shareFilesHasMore: false,
+    shareFilesNextOffset: 0,
     selectedSharedFile: null,
 
     activeJobId: null,
@@ -248,36 +261,76 @@
     if (!state.loggedIn) {
       state.remoteFolders = [];
       state.remoteFiles = [];
+      state.remoteFoldersHasMore = false;
+      state.remoteFilesHasMore = false;
+      state.remoteSearchActive = false;
+      state.remoteSearchHasMore = false;
       state.shares = [];
+      state.sharesHasMore = false;
+      state.shareFolders = [];
+      state.shareFiles = [];
+      state.shareFoldersHasMore = false;
+      state.shareFilesHasMore = false;
       renderRemote();
       return;
     }
     try {
       if (state.remoteTab === 'files') {
         const pid = currentRemoteParentId();
-        const data = await api('GET', `/api/gui/remote/list?parent_id=${encodeURIComponent(pid)}`);
+        const data = await api('GET', `/api/gui/remote/list?parent_id=${encodeURIComponent(pid)}&folder_offset=0&file_offset=0`);
         state.remoteFolders = data.folders || [];
+        state.remoteFoldersHasMore = !!data.folders_has_more;
+        state.remoteFoldersNextOffset = data.folders_next_offset || state.remoteFolders.length;
         state.remoteFiles = data.files || [];
+        state.remoteFilesHasMore = !!data.files_has_more;
+        state.remoteFilesNextOffset = data.files_next_offset || state.remoteFiles.length;
         state.remoteSearchActive = false;
+        state.remoteSearchHasMore = false;
+        state.remoteSearchParams = null;
         state.selectedRemote = null;
       } else if (state.activeShare) {
         const pid = currentShareParentId();
         const data = await api(
           'GET',
-          `/api/gui/remote/shares/${encodeURIComponent(state.activeShare.id)}/browse?parent_id=${encodeURIComponent(pid)}&resource_type=${encodeURIComponent(state.activeShare.resource_type)}`
+          `/api/gui/remote/shares/${encodeURIComponent(state.activeShare.id)}/browse?parent_id=${encodeURIComponent(pid)}&resource_type=${encodeURIComponent(state.activeShare.resource_type)}&folder_offset=0&file_offset=0`
         );
         state.shareFolders = data.folders || [];
+        state.shareFoldersHasMore = !!data.folders_has_more;
+        state.shareFoldersNextOffset = data.folders_next_offset || state.shareFolders.length;
         state.shareFiles = data.files || [];
+        state.shareFilesHasMore = !!data.files_has_more;
+        state.shareFilesNextOffset = data.files_next_offset || state.shareFiles.length;
         state.selectedSharedFile = null;
       } else {
-        const data = await api('GET', '/api/gui/remote/shares?direction=received');
+        const data = await api('GET', '/api/gui/remote/shares?direction=received&offset=0');
         state.shares = data.shares || [];
+        state.sharesHasMore = !!data.has_more;
+        state.sharesNextOffset = data.next_offset || state.shares.length;
         state.selectedSharedFile = null;
       }
       renderRemote();
     } catch (e) {
       showBanner(`Remote error: ${e.message}`, 'error');
     }
+  }
+
+  function renderPagination() {
+    const showMoreFolders = state.loggedIn && (
+      (state.remoteTab === 'files' && !state.remoteSearchActive && state.remoteFoldersHasMore) ||
+      (state.remoteTab === 'shares' && !!state.activeShare && state.shareFoldersHasMore)
+    );
+    const showMoreFiles = state.loggedIn && (
+      (state.remoteTab === 'files' && !state.remoteSearchActive && state.remoteFilesHasMore) ||
+      (state.remoteTab === 'shares' && !!state.activeShare && state.shareFilesHasMore)
+    );
+    const showMoreSearch = state.loggedIn && state.remoteTab === 'files' && state.remoteSearchActive && state.remoteSearchHasMore;
+    const showMoreShares = state.loggedIn && state.remoteTab === 'shares' && !state.activeShare && state.sharesHasMore;
+
+    $('btn-more-folders').classList.toggle('hidden', !showMoreFolders);
+    $('btn-more-files').classList.toggle('hidden', !showMoreFiles);
+    $('btn-more-search').classList.toggle('hidden', !showMoreSearch);
+    $('btn-more-shares').classList.toggle('hidden', !showMoreShares);
+    $('remote-pagination').classList.toggle('hidden', !(showMoreFolders || showMoreFiles || showMoreSearch || showMoreShares));
   }
 
   function renderRemote() {
@@ -287,6 +340,7 @@
     $('remote-toolbar').classList.toggle('hidden', state.remoteTab !== 'files');
     $('shares-toolbar').classList.toggle('hidden', state.remoteTab !== 'shares');
     $('btn-shares-back').classList.toggle('hidden', !state.activeShare);
+    renderPagination();
 
     const nav = $('remote-breadcrumbs');
     nav.innerHTML = '';
@@ -602,8 +656,8 @@
     const vals = await openInputModal('New Local Folder', [{ key: 'name', label: 'Folder name', placeholder: 'e.g. docs' }]);
     if (!vals || !vals.name.trim()) return;
     try {
-      await api('POST', '/api/gui/local/mkdir', { parent: state.localDir, name: vals.name.trim() });
-      showBanner(`Created local folder "${vals.name.trim()}"`, 'success');
+      await api('POST', '/api/gui/local/mkdir', { parent: state.localDir, name: vals.name });
+      showBanner(`Created local folder "${vals.name}"`, 'success');
       loadLocal();
     } catch (e) {
       showBanner(`Local mkdir failed: ${e.message}`, 'error');
@@ -620,8 +674,8 @@
     try {
       await api('POST', '/api/gui/local/rename', {
         path: state.selectedLocal.path,
-        dst_dir: vals.dst_dir.trim(),
-        new_name: vals.new_name.trim(),
+        dst_dir: vals.dst_dir,
+        new_name: vals.new_name,
       });
       showBanner('Local item renamed/moved', 'success');
       loadLocal();
@@ -753,15 +807,92 @@
     if (q) params.set('q', q);
     if (min) params.set('min_size', min);
     if (max) params.set('max_size', max);
+    params.set('offset', '0');
     try {
       const data = await api('GET', `/api/gui/remote/search?${params.toString()}`);
       state.remoteFolders = [];
       state.remoteFiles = data.files || [];
       state.remoteSearchActive = true;
+      state.remoteSearchHasMore = !!data.has_more;
+      state.remoteSearchNextOffset = data.next_offset || state.remoteFiles.length;
+      state.remoteSearchParams = { q, min, max };
       state.selectedRemote = null;
       renderRemote();
     } catch (e) {
       showBanner(`Search failed: ${e.message}`, 'error');
+    }
+  };
+
+  $('btn-more-folders').onclick = async () => {
+    try {
+      if (state.remoteTab === 'files') {
+        const pid = currentRemoteParentId();
+        const data = await api('GET', `/api/gui/remote/list?parent_id=${encodeURIComponent(pid)}&folder_offset=${state.remoteFoldersNextOffset}&file_limit=1&file_offset=0`);
+        state.remoteFolders = state.remoteFolders.concat(data.folders || []);
+        state.remoteFoldersHasMore = !!data.folders_has_more;
+        state.remoteFoldersNextOffset = data.folders_next_offset || state.remoteFolders.length;
+      } else if (state.activeShare) {
+        const pid = currentShareParentId();
+        const data = await api('GET', `/api/gui/remote/shares/${encodeURIComponent(state.activeShare.id)}/browse?parent_id=${encodeURIComponent(pid)}&resource_type=${encodeURIComponent(state.activeShare.resource_type)}&folder_offset=${state.shareFoldersNextOffset}&file_limit=1&file_offset=0`);
+        state.shareFolders = state.shareFolders.concat(data.folders || []);
+        state.shareFoldersHasMore = !!data.folders_has_more;
+        state.shareFoldersNextOffset = data.folders_next_offset || state.shareFolders.length;
+      }
+      renderRemote();
+    } catch (e) {
+      showBanner(`Load more folders failed: ${e.message}`, 'error');
+    }
+  };
+
+  $('btn-more-files').onclick = async () => {
+    try {
+      if (state.remoteTab === 'files') {
+        const pid = currentRemoteParentId();
+        const data = await api('GET', `/api/gui/remote/list?parent_id=${encodeURIComponent(pid)}&folder_limit=1&folder_offset=0&file_offset=${state.remoteFilesNextOffset}`);
+        state.remoteFiles = state.remoteFiles.concat(data.files || []);
+        state.remoteFilesHasMore = !!data.files_has_more;
+        state.remoteFilesNextOffset = data.files_next_offset || state.remoteFiles.length;
+      } else if (state.activeShare) {
+        const pid = currentShareParentId();
+        const data = await api('GET', `/api/gui/remote/shares/${encodeURIComponent(state.activeShare.id)}/browse?parent_id=${encodeURIComponent(pid)}&resource_type=${encodeURIComponent(state.activeShare.resource_type)}&folder_limit=1&folder_offset=0&file_offset=${state.shareFilesNextOffset}`);
+        state.shareFiles = state.shareFiles.concat(data.files || []);
+        state.shareFilesHasMore = !!data.files_has_more;
+        state.shareFilesNextOffset = data.files_next_offset || state.shareFiles.length;
+      }
+      renderRemote();
+    } catch (e) {
+      showBanner(`Load more files failed: ${e.message}`, 'error');
+    }
+  };
+
+  $('btn-more-search').onclick = async () => {
+    if (!state.remoteSearchParams) return;
+    const { q, min, max } = state.remoteSearchParams;
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (min) params.set('min_size', min);
+    if (max) params.set('max_size', max);
+    params.set('offset', String(state.remoteSearchNextOffset));
+    try {
+      const data = await api('GET', `/api/gui/remote/search?${params.toString()}`);
+      state.remoteFiles = state.remoteFiles.concat(data.files || []);
+      state.remoteSearchHasMore = !!data.has_more;
+      state.remoteSearchNextOffset = data.next_offset || state.remoteFiles.length;
+      renderRemote();
+    } catch (e) {
+      showBanner(`Load more search results failed: ${e.message}`, 'error');
+    }
+  };
+
+  $('btn-more-shares').onclick = async () => {
+    try {
+      const data = await api('GET', `/api/gui/remote/shares?direction=received&offset=${state.sharesNextOffset}`);
+      state.shares = state.shares.concat(data.shares || []);
+      state.sharesHasMore = !!data.has_more;
+      state.sharesNextOffset = data.next_offset || state.shares.length;
+      renderRemote();
+    } catch (e) {
+      showBanner(`Load more shares failed: ${e.message}`, 'error');
     }
   };
 

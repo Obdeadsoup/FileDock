@@ -2,18 +2,14 @@ package gui
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path"
 	"sync"
-	"time"
 
 	"example.com/filedock/internal/syncclient"
 )
+
+var errPausedAfterChunks = errors.New("paused after requested chunk count")
 
 type UploadJobSnapshot struct {
 	JobID           string `json:"job_id"`
@@ -35,6 +31,9 @@ type UploadJobSnapshot struct {
 }
 
 type uploadJob struct {
+	ownerSessionID string
+	ownerUserID    string
+
 	mu     sync.Mutex
 	snap   UploadJobSnapshot
 	cancel context.CancelFunc
@@ -56,14 +55,41 @@ func newJobManager() *jobManager {
 	return &jobManager{jobs: make(map[string]*uploadJob)}
 }
 
-func (m *jobManager) get(jobID string) (*uploadJob, bool) {
+func (m *jobManager) getForOwner(jobID, guiSessionID, remoteUserID string) (*uploadJob, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
-	return j, ok
+	if !ok {
+		return nil, false
+	}
+	if j.ownerSessionID != guiSessionID || j.ownerUserID != remoteUserID {
+		return nil, false
+	}
+	return j, true
 }
 
+func (m *jobManager) cancelAndCleanForOwner(guiSessionID, remoteUserID string) {
+	m.mu.Lock()
+	var owned []*uploadJob
+	for id, j := range m.jobs {
+		if j.ownerSessionID == guiSessionID && (remoteUserID == "" || j.ownerUserID == remoteUserID) {
+			owned = append(owned, j)
+			delete(m.jobs, id)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, j := range owned {
+		j.cancel()
+		<-j.done
+	}
+}
+
+// startResumableUpload opens the local file safely inside os.Root and delegates all chunked
+// upload protocol logic (hashing, session create/resume, source mismatch check, skipping confirmed
+// chunks, and idempotent completion) to syncclient.Upload.
 func (m *jobManager) startResumableUpload(
+	guiSessionID string,
 	localDir string,
 	remote *remoteClient,
 	localRelPath string,
@@ -76,192 +102,127 @@ func (m *jobManager) startResumableUpload(
 		return UploadJobSnapshot{}, err
 	}
 
+	api, ownerUserID, err := remote.syncAPI()
+	if err != nil {
+		_ = f.Close()
+		return UploadJobSnapshot{}, err
+	}
+
 	fileSize := info.Size()
-	fileName := path.Base(cleanedPath)
-	fileSHA, err := hashFileStream(f)
-	if err != nil {
-		_ = f.Close()
-		return UploadJobSnapshot{}, err
-	}
-
-	api, err := remote.syncAPI()
-	if err != nil {
-		_ = f.Close()
-		return UploadJobSnapshot{}, err
-	}
-
-	initCtx, cancelInit := context.WithTimeout(context.Background(), 30*time.Second)
-	var (
-		session syncclient.UploadSessionInfo
-		resumed bool
-	)
-	if resumeSessionID == "" {
-		session, err = api.CreateUploadSession(initCtx, parentID, fileName, fileSize, fileSHA)
-	} else {
-		resumed = true
-		session, err = api.GetUploadSession(initCtx, resumeSessionID)
-		if err == nil && (session.Size != fileSize || session.SHA256 != fileSHA) {
-			err = fmt.Errorf("%w: local size=%d sha=%s, session size=%d sha=%s",
-				syncclient.ErrUploadSourceMismatch, fileSize, fileSHA, session.Size, session.SHA256)
-		}
-	}
-	cancelInit()
-	if err != nil {
-		_ = f.Close()
-		return UploadJobSnapshot{}, err
-	}
-
+	fileName := baseRelName(cleanedPath)
 	jobID := randomHex(8)
 	runCtx, cancel := context.WithCancel(context.Background())
+
 	job := &uploadJob{
+		ownerSessionID: guiSessionID,
+		ownerUserID:    ownerUserID,
 		snap: UploadJobSnapshot{
-			JobID:           jobID,
-			SessionID:       session.ID,
-			LocalPath:       cleanedPath,
-			FileName:        fileName,
-			TotalSize:       fileSize,
-			ChunkSize:       session.ChunkSize,
-			TotalChunks:     session.TotalChunks,
-			ConfirmedChunks: len(session.UploadedChunks),
-			Status:          "running",
-			SHA256:          fileSHA,
-			Resumed:         resumed,
+			JobID:     jobID,
+			LocalPath: cleanedPath,
+			FileName:  fileName,
+			TotalSize: fileSize,
+			Status:    "running",
+			Resumed:   resumeSessionID != "",
 		},
 		cancel: cancel,
 		done:   make(chan struct{}),
+	}
+
+	readyCh := make(chan error, 1)
+	readySent := false
+	signalReady := func(err error) {
+		if !readySent {
+			readySent = true
+			readyCh <- err
+		}
 	}
 
 	m.mu.Lock()
 	m.jobs[jobID] = job
 	m.mu.Unlock()
 
-	go runUploadJob(runCtx, job, f, api, session, fileSize, stopAfterChunks)
+	go func() {
+		defer close(job.done)
+		defer f.Close()
 
-	return job.snapshot(), nil
-}
+		sentThisRun := 0
+		res, upErr := syncclient.Upload(runCtx, syncclient.UploadConfig{
+			API:       api,
+			Source:    f,
+			FileName:  fileName,
+			FileSize:  fileSize,
+			ParentID:  parentID,
+			SessionID: resumeSessionID,
+			OnSessionReady: func(session syncclient.UploadSessionInfo) {
+				job.mu.Lock()
+				job.snap.SessionID = session.ID
+				job.snap.ChunkSize = session.ChunkSize
+				job.snap.TotalChunks = session.TotalChunks
+				job.snap.ConfirmedChunks = len(session.UploadedChunks)
+				job.snap.SHA256 = session.SHA256
+				job.mu.Unlock()
+				signalReady(nil)
+			},
+			OnProgress: func(p syncclient.UploadProgress) {
+				job.mu.Lock()
+				job.snap.SessionID = p.SessionID
+				job.snap.ChunkSize = p.ChunkSize
+				job.snap.TotalChunks = p.TotalChunks
+				job.snap.ConfirmedChunks = p.ConfirmedChunks
+				job.snap.ChunksSent = p.ChunksSent
+				job.snap.ChunksSkipped = p.ChunksSkipped
+				job.snap.BytesSent = p.BytesSent
+				if p.SHA256 != "" {
+					job.snap.SHA256 = p.SHA256
+				}
+				job.mu.Unlock()
+			},
+			AfterChunkHook: func(_ int) error {
+				sentThisRun++
+				if stopAfterChunks > 0 && sentThisRun >= stopAfterChunks {
+					return errPausedAfterChunks
+				}
+				return nil
+			},
+		})
 
-func runUploadJob(
-	ctx context.Context,
-	job *uploadJob,
-	f *os.File,
-	api *syncclient.HTTPAPI,
-	session syncclient.UploadSessionInfo,
-	fileSize int64,
-	stopAfterChunks int,
-) {
-	defer close(job.done)
-	defer f.Close()
-
-	if session.Status == "completed" {
-		published, err := api.CompleteUploadSession(ctx, session.ID)
-		job.mu.Lock()
-		if err != nil {
-			job.snap.Status = "failed"
-			job.snap.Error = err.Error()
-		} else {
-			job.snap.Status = "completed"
-			job.snap.ChunksSkipped = session.TotalChunks
-			job.snap.ConfirmedChunks = session.TotalChunks
-			job.snap.FileID = published.ID
-			job.snap.SHA256 = published.SHA256
-		}
-		job.mu.Unlock()
-		return
-	}
-
-	confirmed := make(map[int]bool, len(session.UploadedChunks))
-	for _, idx := range session.UploadedChunks {
-		confirmed[idx] = true
-	}
-
-	sentThisRun := 0
-	for idx := 0; idx < session.TotalChunks; idx++ {
-		if ctx.Err() != nil {
+		if upErr != nil {
+			if !readySent {
+				// Failed before session was ready (e.g., source mismatch, 404, 413): remove job and return error synchronously.
+				m.mu.Lock()
+				delete(m.jobs, jobID)
+				m.mu.Unlock()
+				signalReady(upErr)
+				return
+			}
 			job.mu.Lock()
-			job.snap.Status = "canceled"
-			job.snap.Error = "upload paused/interrupted by user"
-			job.mu.Unlock()
-			return
-		}
-		if confirmed[idx] {
-			job.mu.Lock()
-			job.snap.ChunksSkipped++
-			job.mu.Unlock()
-			continue
-		}
-
-		offset := int64(idx) * session.ChunkSize
-		chunkLen := session.ChunkSize
-		if rem := fileSize - offset; rem < chunkLen {
-			chunkLen = rem
-		}
-		chunkSHA, err := hashReaderStream(io.NewSectionReader(f, offset, chunkLen))
-		if err != nil {
-			job.mu.Lock()
-			job.snap.Status = "failed"
-			job.snap.Error = err.Error()
-			job.mu.Unlock()
-			return
-		}
-		if err := api.UploadChunk(ctx, session.ID, idx, chunkSHA, io.NewSectionReader(f, offset, chunkLen), chunkLen); err != nil {
-			job.mu.Lock()
-			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			if errors.Is(upErr, errPausedAfterChunks) {
+				job.snap.Status = "canceled"
+				job.snap.Error = fmt.Sprintf("paused after %d chunk(s); resume with session %s", sentThisRun, job.snap.SessionID)
+			} else if errors.Is(upErr, context.Canceled) || runCtx.Err() != nil {
 				job.snap.Status = "canceled"
 				job.snap.Error = "upload paused/interrupted by user"
 			} else {
 				job.snap.Status = "failed"
-				job.snap.Error = err.Error()
+				job.snap.Error = upErr.Error()
 			}
 			job.mu.Unlock()
 			return
 		}
 
-		sentThisRun++
+		signalReady(nil)
 		job.mu.Lock()
-		job.snap.ChunksSent++
-		job.snap.ConfirmedChunks++
-		job.snap.BytesSent += chunkLen
-		job.mu.Unlock()
-
-		if stopAfterChunks > 0 && sentThisRun >= stopAfterChunks {
-			job.mu.Lock()
-			job.snap.Status = "canceled"
-			job.snap.Error = fmt.Sprintf("paused after %d chunk(s); resume with session %s", sentThisRun, session.ID)
-			job.mu.Unlock()
-			return
-		}
-	}
-
-	published, err := api.CompleteUploadSession(ctx, session.ID)
-	job.mu.Lock()
-	if err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			job.snap.Status = "canceled"
-			job.snap.Error = "upload canceled before completion"
-		} else {
-			job.snap.Status = "failed"
-			job.snap.Error = err.Error()
-		}
-	} else {
 		job.snap.Status = "completed"
-		job.snap.FileID = published.ID
-		job.snap.SHA256 = published.SHA256
-	}
-	job.mu.Unlock()
-}
+		job.snap.FileID = res.File.ID
+		job.snap.SHA256 = res.File.SHA256
+		job.snap.ChunksSent = res.ChunksSent
+		job.snap.ChunksSkipped = res.ChunksSkipped
+		job.snap.BytesSent = res.BytesSent
+		job.mu.Unlock()
+	}()
 
-func hashFileStream(f *os.File) (string, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", err
+	if initErr := <-readyCh; initErr != nil {
+		return UploadJobSnapshot{}, initErr
 	}
-	return hashReaderStream(f)
-}
-
-func hashReaderStream(r io.Reader) (string, error) {
-	h := sha256.New()
-	buf := make([]byte, 64*1024)
-	if _, err := io.CopyBuffer(h, r, buf); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return job.snapshot(), nil
 }

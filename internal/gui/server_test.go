@@ -267,7 +267,7 @@ func TestGUIEndToEndDualAccountConflictVersionAndResumableUpload(t *testing.T) {
 	// 3. Cross-account access: Bob cannot download Alice's private file directly (404),
 	//    but after Alice shares it, Bob downloads via shared endpoint with matching SHA-256!
 	r, _ = guiB.do(t, http.MethodPost, "/api/gui/transfer/download", map[string]string{
-		"file_id": docFile.ID, "file_name": "steal.txt", "local_dir": "", "conflict_policy": "ask",
+		"file_id": docFile.ID, "file_name": "steal.txt", "expected_sha256": v2SHA, "local_dir": "", "conflict_policy": "ask",
 	})
 	if r.StatusCode != http.StatusNotFound {
 		t.Fatalf("bob private download of alice file = %d, want 404", r.StatusCode)

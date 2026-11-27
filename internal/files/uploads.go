@@ -95,6 +95,8 @@ type UploadSessionStore interface {
 	CompleteUploadSession(ctx context.Context, ownerID, sessionID string, file StoredFile, now time.Time) (published File, alreadyCompleted bool, err error)
 	ListExpiredUploadSessions(ctx context.Context, now time.Time, limit int) ([]string, error)
 	DeleteExpiredUploadSession(ctx context.Context, sessionID string) error
+	ListUncleanedCompletedUploadSessions(ctx context.Context, limit int) ([]string, error)
+	MarkUploadChunksCleaned(ctx context.Context, sessionID string) error
 }
 
 // WithUploadChunkSize overrides the chunk size assigned to new upload sessions.
@@ -375,25 +377,34 @@ func (s *Service) CompleteUploadSession(ctx context.Context, ownerID, sessionID 
 	}
 
 	// Clean up staged chunks outside the SQLite transaction; session completion record stays in SQLite for retries.
-	_ = s.blobs.DeleteSessionChunks(context.WithoutCancel(ctx), sessionID)
+	// If immediate cleanup fails (or process crashes before marking cleaned), chunks_cleaned remains 0 so
+	// ProcessExpiredUploadSessions / RunCleanupWorker retries until cleanup succeeds.
+	if delErr := s.blobs.DeleteSessionChunks(context.WithoutCancel(ctx), sessionID); delErr == nil {
+		_ = s.meta.MarkUploadChunksCleaned(context.WithoutCancel(ctx), sessionID)
+	} else {
+		select {
+		case s.cleanupNotify <- struct{}{}:
+		default:
+		}
+	}
 	return published, nil
 }
 
-// ProcessExpiredUploadSessions sweeps expired open upload sessions by removing their staged chunks
-// on disk outside SQLite write transactions and then deleting their SQLite records.
+// ProcessExpiredUploadSessions sweeps expired open upload sessions AND completed upload sessions
+// whose staged chunks were not yet cleaned (e.g., due to transient disk failure or crash).
 func (s *Service) ProcessExpiredUploadSessions(ctx context.Context, batchSize int) (int, error) {
 	if batchSize <= 0 {
 		batchSize = DefaultUploadCleanupBatchSize
 	}
-	expiredIDs, err := s.meta.ListExpiredUploadSessions(ctx, s.now().UTC(), batchSize)
-	if err != nil {
-		return 0, err
-	}
-
 	var (
 		cleaned int
 		errs    []error
 	)
+
+	expiredIDs, err := s.meta.ListExpiredUploadSessions(ctx, s.now().UTC(), batchSize)
+	if err != nil {
+		return 0, err
+	}
 	for _, sessionID := range expiredIDs {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
@@ -409,6 +420,28 @@ func (s *Service) ProcessExpiredUploadSessions(ctx context.Context, batchSize in
 		}
 		cleaned++
 	}
+
+	completedIDs, err := s.meta.ListUncleanedCompletedUploadSessions(ctx, batchSize)
+	if err != nil {
+		errs = append(errs, err)
+		return cleaned, errors.Join(errs...)
+	}
+	for _, sessionID := range completedIDs {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if err := s.blobs.DeleteSessionChunks(ctx, sessionID); err != nil {
+			errs = append(errs, fmt.Errorf("delete completed upload chunks %q: %w", sessionID, err))
+			continue
+		}
+		if err := s.meta.MarkUploadChunksCleaned(ctx, sessionID); err != nil {
+			errs = append(errs, fmt.Errorf("mark upload chunks cleaned %q: %w", sessionID, err))
+			continue
+		}
+		cleaned++
+	}
+
 	return cleaned, errors.Join(errs...)
 }
 
